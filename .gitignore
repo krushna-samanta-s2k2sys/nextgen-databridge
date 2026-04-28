@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+*.env
+
+# Node
+node_modules/
+dist/
+.cache/
+
+# Airflow
+airflow/logs/
+airflow/plugins/__pycache__/
+
+# Terraform
+infra/terraform/.terraform/
+infra/terraform/*.tfstate
+infra/terraform/*.tfstate.backup
+infra/terraform/*.tfvars
+
+# Local dev
+.DS_Store
+*.duckdb
+/tmp/
+
+# Secrets
+*.pem
+*.key
+secrets/
