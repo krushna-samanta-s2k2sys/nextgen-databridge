@@ -1,22 +1,45 @@
-name: Promote to Staging / Production
+name: Promote — Staging / Production
 
-# Triggered manually. Promotes the image that passed dev to a higher environment.
-# Images are NEVER rebuilt — the exact SHA-tagged image from dev is reused.
+# Two trigger modes:
 #
-# GitHub Environment protection rules gate each promotion:
-#   staging    → requires 1 approver
-#   production → requires 1 approver + deployment branch policy
+#   Automatic (workflow_run):
+#     Fires when "Deploy — Dev" completes successfully on main.
+#     Queues staging deployment → waits for GitHub Environment approval → deploys.
+#     Then queues production deployment → waits for GitHub Environment approval → deploys.
+#
+#   Manual (workflow_dispatch):
+#     Target a specific environment (staging OR production).
+#     The targeted environment still requires GitHub approval before deploying.
+#
+# Images are NEVER rebuilt. The SHA-tagged image from dev ECR is copied to the
+# target account's ECR, then deployed from there.
+#
+# Required GitHub Secrets:
+#   AWS_ROLE_ARN_DEV, AWS_ROLE_ARN_STAGING, AWS_ROLE_ARN_PROD
+#   DB_PASSWORD, MSSQL_PASSWORD
+#   SLACK_WEBHOOK_URL (optional)
+#
+# Required GitHub Environments (configure required reviewers in each):
+#   staging    — at least 1 approver
+#   production — at least 1 approver, restrict to main branch
 
 on:
+  # Auto-trigger after a successful dev deployment
+  workflow_run:
+    workflows: ["Deploy — Dev"]
+    types: [completed]
+    branches: [main]
+
+  # Manual re-run or targeted single-environment promotion
   workflow_dispatch:
     inputs:
       environment:
-        description: "Target environment"
+        description: Target environment
         required: true
         type: choice
         options: [staging, production]
       image_tag:
-        description: "Image tag to deploy (e.g. sha-abc1234). Leave empty to use the tag recorded from the previous environment."
+        description: "Image tag (e.g. sha-abc1234). Leave blank to auto-resolve from the previous environment."
         required: false
         default: ""
 
@@ -26,19 +49,51 @@ permissions:
 
 env:
   AWS_REGION: us-east-1
-  TF_VAR_db_password: "ActionDag!1"
-  TF_VAR_mssql_password: "ActionDag!1"
+  TF_VERSION: "~1.6"
+  STATE_BUCKET: nextgen-databridge-terraform-state
+  LOCK_TABLE: nextgen-databridge-terraform-locks
 
 jobs:
-  # ── 1. Resolve which image tag to promote ──────────────────────────────────
+  # ── Guard ────────────────────────────────────────────────────────────────────
+  # Skip the entire workflow if triggered by a failed dev run.
+  guard:
+    name: Check Trigger
+    runs-on: ubuntu-latest
+    if: |
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success')
+    outputs:
+      # staging runs when: auto-triggered (workflow_run) OR manual targeting staging
+      run_staging: ${{ steps.cfg.outputs.run_staging }}
+      # production runs when: auto-triggered (full pipeline) OR manual targeting production
+      run_production: ${{ steps.cfg.outputs.run_production }}
+    steps:
+      - name: Resolve deployment targets
+        id: cfg
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_run" ]]; then
+            echo "Auto-triggered by successful dev deployment — running full pipeline (staging → production)"
+            echo "run_staging=true"    >> "$GITHUB_OUTPUT"
+            echo "run_production=true" >> "$GITHUB_OUTPUT"
+          elif [[ "${{ inputs.environment }}" == "staging" ]]; then
+            echo "Manual trigger — staging only"
+            echo "run_staging=true"     >> "$GITHUB_OUTPUT"
+            echo "run_production=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Manual trigger — production only"
+            echo "run_staging=false"   >> "$GITHUB_OUTPUT"
+            echo "run_production=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  # ── Resolve image tag ────────────────────────────────────────────────────────
   resolve-image-tag:
     name: Resolve Image Tag
     runs-on: ubuntu-latest
+    needs: guard
     outputs:
       image_tag: ${{ steps.resolve.outputs.image_tag }}
-      source_env: ${{ steps.resolve.outputs.source_env }}
     steps:
-      - name: Configure AWS credentials (dev account — SSM is always in dev)
+      - name: Configure AWS credentials (dev — SSM lives in dev account)
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN_DEV }}
@@ -50,263 +105,696 @@ jobs:
           if [[ -n "${{ inputs.image_tag }}" ]]; then
             TAG="${{ inputs.image_tag }}"
             echo "Using manually specified tag: $TAG"
-          else
-            # Read from SSM: staging promotes from dev, production promotes from staging
-            if [[ "${{ inputs.environment }}" == "staging" ]]; then
-              SOURCE_ENV="dev"
-            else
-              SOURCE_ENV="staging"
-            fi
+          elif [[ "${{ github.event_name }}" == "workflow_run" || "${{ inputs.environment }}" == "staging" ]]; then
             TAG=$(aws ssm get-parameter \
-              --name "/nextgen-databridge/image-tag/${SOURCE_ENV}" \
-              --query Parameter.Value --output text)
-            echo "Promoting tag from ${SOURCE_ENV}: $TAG"
-            echo "source_env=${SOURCE_ENV}" >> "$GITHUB_OUTPUT"
+              --name "/nextgen-databridge/image-tag/dev" \
+              --query Parameter.Value --output text 2>/dev/null || echo "")
+            echo "Promoting dev tag: $TAG"
+          else
+            TAG=$(aws ssm get-parameter \
+              --name "/nextgen-databridge/image-tag/staging" \
+              --query Parameter.Value --output text 2>/dev/null || echo "")
+            echo "Promoting staging tag: $TAG"
           fi
-
-          [[ -z "$TAG" ]] && { echo "ERROR: No image tag found."; exit 1; }
+          [[ -z "$TAG" ]] && {
+            echo "ERROR: No image tag found. Deploy to the source environment first."
+            exit 1
+          }
           echo "image_tag=${TAG}" >> "$GITHUB_OUTPUT"
-          echo "Resolved image tag: $TAG"
 
-  # ── 2. Core infrastructure ─────────────────────────────────────────────────
-  deploy-core:
-    name: Deploy Core — ${{ inputs.environment }}
+  # ════════════════════════════════════════════════════════════════════════════
+  # STAGING — gated by GitHub Environment approval
+  # ════════════════════════════════════════════════════════════════════════════
+
+  copy-images-staging:
+    name: Copy ECR Images → staging
     runs-on: ubuntu-latest
-    needs: [resolve-image-tag]
-    environment: ${{ inputs.environment }}   # ← GitHub env gate (approval here)
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: ${{ inputs.environment == 'staging' && secrets.AWS_ROLE_ARN_STAGING || secrets.AWS_ROLE_ARN_PROD }}
-          aws-region: ${{ env.AWS_REGION }}
-
-      - uses: hashicorp/setup-terraform@v3
-        with:
-          terraform_version: "~1.6"
-
-      - name: Ensure Terraform state bucket
-        run: |
-          BUCKET="nextgen-databridge-terraform-state"
-          if ! aws s3api head-bucket --bucket "$BUCKET" 2>/dev/null; then
-            aws s3api create-bucket --bucket "$BUCKET" --region ${{ env.AWS_REGION }}
-            aws s3api put-bucket-versioning \
-              --bucket "$BUCKET" \
-              --versioning-configuration Status=Enabled
-          fi
-
-      - name: terraform init
-        working-directory: infra/terraform/core
-        run: terraform init
-
-      - name: terraform apply
-        working-directory: infra/terraform/core
-        run: |
-          terraform apply -auto-approve \
-            -var="environment=${{ inputs.environment }}"
-
-      - name: Upload environment config
-        run: |
-          aws s3 cp configs/environments/${{ inputs.environment }}.json \
-            s3://nextgen-databridge-pipeline-configs-${{ inputs.environment }}/environments/${{ inputs.environment }}.json
-
-      - name: Upload pipeline configs
-        run: |
-          for f in configs/pipelines/*.json; do
-            aws s3 cp "$f" \
-              s3://nextgen-databridge-pipeline-configs-${{ inputs.environment }}/active/$(basename "$f")
-          done
-
-  # ── 3. WideWorldImporters ───────────────────────────────────────────────────
-  deploy-wwi:
-    name: Deploy WideWorldImporters — ${{ inputs.environment }}
-    runs-on: ubuntu-latest
-    needs: [resolve-image-tag, deploy-core]
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: ${{ inputs.environment == 'staging' && secrets.AWS_ROLE_ARN_STAGING || secrets.AWS_ROLE_ARN_PROD }}
-          aws-region: ${{ env.AWS_REGION }}
-
-      - uses: hashicorp/setup-terraform@v3
-        with:
-          terraform_version: "~1.6"
-
-      - name: terraform init
-        working-directory: infra/terraform/wwi
-        run: terraform init
-
-      - name: terraform apply
-        working-directory: infra/terraform/wwi
-        run: |
-          terraform apply -auto-approve \
-            -var="environment=${{ inputs.environment }}"
-
-  # ── 4. MWAA ─────────────────────────────────────────────────────────────────
-  deploy-mwaa:
-    name: Deploy MWAA — ${{ inputs.environment }}
-    runs-on: ubuntu-latest
-    needs: [resolve-image-tag, deploy-core]
+    needs: [guard, resolve-image-tag]
+    if: needs.guard.outputs.run_staging == 'true'
     outputs:
-      mwaa_bucket: ${{ steps.tf-out.outputs.mwaa_bucket }}
+      target_registry: ${{ steps.push.outputs.target_registry }}
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: ${{ inputs.environment == 'staging' && secrets.AWS_ROLE_ARN_STAGING || secrets.AWS_ROLE_ARN_PROD }}
-          aws-region: ${{ env.AWS_REGION }}
-
-      - uses: hashicorp/setup-terraform@v3
-        with:
-          terraform_version: "~1.6"
-
-      - name: terraform init
-        working-directory: infra/terraform/mwaa
-        run: terraform init
-
-      - name: terraform apply
-        working-directory: infra/terraform/mwaa
-        run: |
-          terraform apply -auto-approve \
-            -var="environment=${{ inputs.environment }}"
-
-      - name: Get MWAA bucket
-        id: tf-out
-        working-directory: infra/terraform/mwaa
-        run: echo "mwaa_bucket=$(terraform output -raw mwaa_bucket)" >> "$GITHUB_OUTPUT"
-
-      - name: Upload DAGs
-        run: MWAA_BUCKET=${{ steps.tf-out.outputs.mwaa_bucket }} bash airflow/deploy_to_mwaa.sh
-
-  # ── 5. EKS applications — using the PROMOTED image, no rebuild ─────────────
-  deploy-apps:
-    name: Deploy EKS Apps — ${{ inputs.environment }} @ ${{ needs.resolve-image-tag.outputs.image_tag }}
-    runs-on: ubuntu-latest
-    needs: [resolve-image-tag, deploy-core, deploy-mwaa]
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Configure AWS credentials (dev — to pull image from dev ECR)
+      - name: Configure AWS credentials (dev — pull source images)
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN_DEV }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Get dev ECR registry (image lives here)
-        id: dev-registry
+      - name: Pull images from dev ECR
+        id: pull
         run: |
-          ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
-          echo "registry=${ACCOUNT}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com" >> "$GITHUB_OUTPUT"
+          DEV_ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
+          DEV_REGISTRY="${DEV_ACCOUNT}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com"
+          DEV_TOKEN=$(aws ecr get-login-password --region ${{ env.AWS_REGION }})
+          echo "::add-mask::${DEV_TOKEN}"
+          echo "dev_registry=${DEV_REGISTRY}" >> "$GITHUB_OUTPUT"
+          echo "${DEV_TOKEN}" | docker login --username AWS --password-stdin "${DEV_REGISTRY}"
+          TAG="${{ needs.resolve-image-tag.outputs.image_tag }}"
+          for svc in api ui transform; do
+            docker pull "${DEV_REGISTRY}/nextgen-databridge/${svc}:${TAG}"
+          done
 
-      - name: Configure AWS credentials (target env — for EKS + Secrets Manager)
+      - name: Configure AWS credentials (staging — push to staging ECR)
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: ${{ inputs.environment == 'staging' && secrets.AWS_ROLE_ARN_STAGING || secrets.AWS_ROLE_ARN_PROD }}
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN_STAGING }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Install kubectl
-        uses: azure/setup-kubectl@v4
+      - name: Push images to staging ECR
+        id: push
+        env:
+          DEV_REGISTRY: ${{ steps.pull.outputs.dev_registry }}
+          TAG: ${{ needs.resolve-image-tag.outputs.image_tag }}
+        run: |
+          STAGING_ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
+          STAGING_REGISTRY="${STAGING_ACCOUNT}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com"
+          echo "target_registry=${STAGING_REGISTRY}" >> "$GITHUB_OUTPUT"
+          aws ecr get-login-password --region ${{ env.AWS_REGION }} | \
+            docker login --username AWS --password-stdin "${STAGING_REGISTRY}"
+          for svc in api ui transform; do
+            aws ecr describe-repositories --repository-names "nextgen-databridge/${svc}" 2>/dev/null \
+              || aws ecr create-repository --repository-name "nextgen-databridge/${svc}" \
+                   --image-scanning-configuration scanOnPush=true \
+                   --encryption-configuration encryptionType=AES256
+            docker tag "${DEV_REGISTRY}/nextgen-databridge/${svc}:${TAG}" \
+                       "${STAGING_REGISTRY}/nextgen-databridge/${svc}:${TAG}"
+            docker tag "${DEV_REGISTRY}/nextgen-databridge/${svc}:${TAG}" \
+                       "${STAGING_REGISTRY}/nextgen-databridge/${svc}:staging"
+            docker push "${STAGING_REGISTRY}/nextgen-databridge/${svc}:${TAG}"
+            docker push "${STAGING_REGISTRY}/nextgen-databridge/${svc}:staging"
+          done
 
+  deploy-core-staging:
+    name: Deploy Core — staging
+    runs-on: ubuntu-latest
+    needs: [guard, resolve-image-tag, copy-images-staging]
+    if: needs.guard.outputs.run_staging == 'true'
+    environment: staging          # ← GitHub approval gate
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN_STAGING }}
+          aws-region: ${{ env.AWS_REGION }}
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+      - name: Ensure Terraform backend
+        run: |
+          BUCKET="${{ env.STATE_BUCKET }}"
+          if ! aws s3api head-bucket --bucket "$BUCKET" 2>/dev/null; then
+            aws s3api create-bucket --bucket "$BUCKET" --region us-east-1
+            aws s3api put-bucket-versioning --bucket "$BUCKET" \
+              --versioning-configuration Status=Enabled
+            aws s3api put-bucket-encryption --bucket "$BUCKET" \
+              --server-side-encryption-configuration \
+              '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"}}]}'
+          fi
+          if ! aws dynamodb describe-table --table-name "${{ env.LOCK_TABLE }}" --region us-east-1 2>/dev/null; then
+            aws dynamodb create-table \
+              --table-name "${{ env.LOCK_TABLE }}" --region us-east-1 \
+              --attribute-definitions AttributeName=LockID,AttributeType=S \
+              --key-schema AttributeName=LockID,KeyType=HASH \
+              --billing-mode PAY_PER_REQUEST
+            aws dynamodb wait table-exists --table-name "${{ env.LOCK_TABLE }}" --region us-east-1
+          fi
+      - name: terraform init
+        working-directory: infra/terraform/core
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ env.STATE_BUCKET }}" \
+            -backend-config="key=nextgen-databridge/staging/core/terraform.tfstate" \
+            -backend-config="region=us-east-1" \
+            -backend-config="dynamodb_table=${{ env.LOCK_TABLE }}"
+      - name: terraform apply
+        working-directory: infra/terraform/core
+        env:
+          TF_VAR_db_password: ${{ secrets.DB_PASSWORD }}
+          TF_VAR_mssql_password: ${{ secrets.MSSQL_PASSWORD }}
+        run: |
+          terraform apply -auto-approve \
+            -var="environment=staging" \
+            -var="aws_region=${{ env.AWS_REGION }}"
+      - name: Upload configs
+        run: |
+          ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
+          BUCKET="nextgen-databridge-pipeline-configs-staging-${ACCOUNT}"
+          aws s3 cp configs/environments/staging.json s3://${BUCKET}/environments/staging.json 2>/dev/null || true
+          for f in configs/pipelines/*.json; do
+            aws s3 cp "$f" s3://${BUCKET}/active/$(basename "$f") 2>/dev/null || true
+          done
+
+  deploy-wwi-staging:
+    name: Deploy WideWorldImporters — staging
+    runs-on: ubuntu-latest
+    needs: [guard, resolve-image-tag, deploy-core-staging]
+    if: needs.guard.outputs.run_staging == 'true'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN_STAGING }}
+          aws-region: ${{ env.AWS_REGION }}
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+      - name: terraform init
+        working-directory: infra/terraform/wwi
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ env.STATE_BUCKET }}" \
+            -backend-config="key=nextgen-databridge/staging/wwi/terraform.tfstate" \
+            -backend-config="region=us-east-1" \
+            -backend-config="dynamodb_table=${{ env.LOCK_TABLE }}"
+      - name: terraform apply
+        working-directory: infra/terraform/wwi
+        env:
+          TF_VAR_db_password: ${{ secrets.DB_PASSWORD }}
+          TF_VAR_mssql_password: ${{ secrets.MSSQL_PASSWORD }}
+        run: |
+          terraform apply -auto-approve \
+            -var="environment=staging" \
+            -var="aws_region=${{ env.AWS_REGION }}"
+
+  deploy-mwaa-staging:
+    name: Deploy MWAA — staging
+    runs-on: ubuntu-latest
+    needs: [guard, resolve-image-tag, deploy-core-staging]
+    if: needs.guard.outputs.run_staging == 'true'
+    outputs:
+      mwaa_url: ${{ steps.mwaa-url.outputs.url }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN_STAGING }}
+          aws-region: ${{ env.AWS_REGION }}
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+      - name: terraform init
+        working-directory: infra/terraform/mwaa
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ env.STATE_BUCKET }}" \
+            -backend-config="key=nextgen-databridge/staging/mwaa/terraform.tfstate" \
+            -backend-config="region=us-east-1" \
+            -backend-config="dynamodb_table=${{ env.LOCK_TABLE }}"
+      - name: terraform apply
+        working-directory: infra/terraform/mwaa
+        env:
+          TF_VAR_db_password: ${{ secrets.DB_PASSWORD }}
+          TF_VAR_mssql_password: ${{ secrets.MSSQL_PASSWORD }}
+        run: |
+          terraform apply -auto-approve \
+            -var="environment=staging" \
+            -var="aws_region=${{ env.AWS_REGION }}"
+      - name: Upload DAGs
+        run: |
+          MWAA_BUCKET=$(cd infra/terraform/mwaa && terraform output -raw mwaa_bucket)
+          MWAA_BUCKET="$MWAA_BUCKET" bash airflow/deploy_to_mwaa.sh
+      - name: Get MWAA URL
+        id: mwaa-url
+        run: |
+          URL=$(aws mwaa get-environment \
+            --name "nextgen-databridge-staging" \
+            --query "Environment.WebserverUrl" \
+            --output text 2>/dev/null || echo "pending")
+          echo "url=https://${URL}" >> "$GITHUB_OUTPUT"
+
+  deploy-apps-staging:
+    name: "Deploy EKS Apps — staging @ ${{ needs.resolve-image-tag.outputs.image_tag }}"
+    runs-on: ubuntu-latest
+    needs: [guard, resolve-image-tag, copy-images-staging, deploy-core-staging, deploy-mwaa-staging]
+    if: needs.guard.outputs.run_staging == 'true'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN_STAGING }}
+          aws-region: ${{ env.AWS_REGION }}
+      - uses: azure/setup-kubectl@v4
       - name: Update kubeconfig
-        run: aws eks update-kubeconfig --region ${{ env.AWS_REGION }} --name nextgen-databridge
-
+        run: aws eks update-kubeconfig --region ${{ env.AWS_REGION }} --name nextgen-databridge-staging
       - name: Resolve dynamic values
         id: resolve
         run: |
           ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
-          echo "account=${ACCOUNT}" >> "$GITHUB_OUTPUT"
-
+          REGISTRY="${ACCOUNT}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com"
+          echo "account=${ACCOUNT}"    >> "$GITHUB_OUTPUT"
+          echo "registry=${REGISTRY}" >> "$GITHUB_OUTPUT"
           DB_SECRET=$(aws secretsmanager get-secret-value \
             --secret-id "nextgen-databridge/connections/audit_db" \
-            --query SecretString --output text)
-          DB_URL=$(python3 -c "import json,sys; d=json.loads(sys.argv[1]); print(d['url'])" "$DB_SECRET")
+            --query SecretString --output text 2>/dev/null || echo '{"url":""}')
+          DB_URL=$(python3 -c "import json,sys; d=json.loads(sys.argv[1]); print(d.get('url',''))" "$DB_SECRET")
+          echo "::add-mask::${DB_URL}"
           echo "database_url=${DB_URL}" >> "$GITHUB_OUTPUT"
-
-          MWAA_URL=$(aws mwaa get-environment \
-            --name nextgen-databridge \
-            --query "Environment.WebserverUrl" \
-            --output text 2>/dev/null || echo "pending")
-          echo "airflow_url=https://${MWAA_URL}" >> "$GITHUB_OUTPUT"
-
-      - name: Apply Kubernetes manifests (promoted image — no rebuild)
+          echo "airflow_url=${{ needs.deploy-mwaa-staging.outputs.mwaa_url }}" >> "$GITHUB_OUTPUT"
+          echo "duckdb_bucket=nextgen-databridge-duckdb-store-staging-${ACCOUNT}"   >> "$GITHUB_OUTPUT"
+          echo "configs_bucket=nextgen-databridge-pipeline-configs-staging-${ACCOUNT}" >> "$GITHUB_OUTPUT"
+      - name: Apply Kubernetes manifests
         env:
           IMAGE_TAG: ${{ needs.resolve-image-tag.outputs.image_tag }}
-          # Image always pulled from dev ECR (same account or ECR replication configured)
-          REGISTRY: ${{ steps.dev-registry.outputs.registry }}
+          REGISTRY: ${{ steps.resolve.outputs.registry }}
           ACCOUNT: ${{ steps.resolve.outputs.account }}
           DATABASE_URL: ${{ steps.resolve.outputs.database_url }}
           AIRFLOW_URL: ${{ steps.resolve.outputs.airflow_url }}
+          DUCKDB_BUCKET: ${{ steps.resolve.outputs.duckdb_bucket }}
+          CONFIGS_BUCKET: ${{ steps.resolve.outputs.configs_bucket }}
         run: |
           sed \
             -e "s|__ACCOUNT_ID__|${ACCOUNT}|g" \
             -e "s|__REGISTRY__|${REGISTRY}|g" \
             -e "s|__IMAGE_TAG__|${IMAGE_TAG}|g" \
-            -e "s|__ENVIRONMENT__|${{ inputs.environment }}|g" \
-            -e "s|__DUCKDB_BUCKET__|nextgen-databridge-duckdb-store-${{ inputs.environment }}|g" \
-            -e "s|__PIPELINE_CONFIGS_BUCKET__|nextgen-databridge-pipeline-configs-${{ inputs.environment }}|g" \
+            -e "s|__ENVIRONMENT__|staging|g" \
+            -e "s|__DUCKDB_BUCKET__|${DUCKDB_BUCKET}|g" \
+            -e "s|__PIPELINE_CONFIGS_BUCKET__|${CONFIGS_BUCKET}|g" \
             -e "s|__DATABASE_URL__|${DATABASE_URL}|g" \
             -e "s|__AIRFLOW_URL__|${AIRFLOW_URL}|g" \
-            -e "s|__API_SECRET_KEY__|nextgen-databridge-${{ inputs.environment }}-${IMAGE_TAG}|g" \
+            -e "s|__API_SECRET_KEY__|nextgen-databridge-staging-${IMAGE_TAG}|g" \
             eks/manifests/platform.yaml | kubectl apply -f -
-
       - name: Wait for rollout
         run: |
-          kubectl rollout status deployment/nextgen-databridge-api \
-            -n nextgen-databridge --timeout=180s
-          kubectl rollout status deployment/nextgen-databridge-ui \
-            -n nextgen-databridge --timeout=120s
-
-      - name: Print endpoints
+          kubectl rollout status deployment/nextgen-databridge-api -n nextgen-databridge --timeout=300s
+          kubectl rollout status deployment/nextgen-databridge-ui  -n nextgen-databridge --timeout=180s
+      - name: Rollback on failure
+        if: failure()
         run: |
-          kubectl get svc -n nextgen-databridge \
-            -o custom-columns='NAME:.metadata.name,EXTERNAL-IP:.status.loadBalancer.ingress[0].hostname,PORT:.spec.ports[0].port' \
-            2>/dev/null || true
+          kubectl rollout undo deployment/nextgen-databridge-api -n nextgen-databridge || true
+          kubectl rollout undo deployment/nextgen-databridge-ui  -n nextgen-databridge || true
 
-  # ── 6. Record promoted image tag in SSM ─────────────────────────────────────
-  record-image-tag:
-    name: Record Image Tag in SSM
+  smoke-test-staging:
+    name: Smoke Tests — staging
     runs-on: ubuntu-latest
-    needs: [resolve-image-tag, deploy-apps]
+    needs: [guard, resolve-image-tag, deploy-apps-staging]
+    if: needs.guard.outputs.run_staging == 'true'
     steps:
-      - name: Configure AWS credentials (dev — SSM lives in dev account)
-        uses: aws-actions/configure-aws-credentials@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN_STAGING }}
+          aws-region: ${{ env.AWS_REGION }}
+      - uses: azure/setup-kubectl@v4
+      - name: Update kubeconfig
+        run: aws eks update-kubeconfig --region ${{ env.AWS_REGION }} --name nextgen-databridge-staging
+      - name: Wait for pods ready
+        run: |
+          kubectl wait pod -n nextgen-databridge \
+            --for=condition=Ready --selector=app=nextgen-databridge-api --timeout=180s
+      - name: Health check — staging API
+        run: |
+          HOST=$(kubectl get svc nextgen-databridge-api-lb -n nextgen-databridge \
+            -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "")
+          if [[ -n "$HOST" ]]; then
+            for i in {1..12}; do
+              STATUS=$(curl -sf -o /dev/null -w "%{http_code}" "http://${HOST}/health" 2>/dev/null || echo "000")
+              [[ "$STATUS" == "200" ]] && { echo "Health check passed (attempt $i)"; break; }
+              echo "Attempt $i: HTTP $STATUS — retrying in 15s..."
+              sleep 15
+            done
+            [[ "$STATUS" == "200" ]] || { echo "ERROR: staging API health check failed"; exit 1; }
+          else
+            echo "LB not yet provisioned — pod-level check only"
+            kubectl get pods -n nextgen-databridge
+          fi
+
+  record-staging-tag:
+    name: Record Staging Image Tag
+    runs-on: ubuntu-latest
+    needs: [resolve-image-tag, smoke-test-staging]
+    if: needs.smoke-test-staging.result == 'success'
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN_DEV }}
           aws-region: ${{ env.AWS_REGION }}
-
-      - name: Write promoted tag to SSM
-        run: |
+      - run: |
           aws ssm put-parameter \
-            --name "/nextgen-databridge/image-tag/${{ inputs.environment }}" \
+            --name "/nextgen-databridge/image-tag/staging" \
             --value "${{ needs.resolve-image-tag.outputs.image_tag }}" \
-            --type String \
-            --overwrite
-          echo "Recorded ${{ inputs.environment }} image tag: ${{ needs.resolve-image-tag.outputs.image_tag }}"
+            --type String --overwrite
+          echo "Recorded staging tag: ${{ needs.resolve-image-tag.outputs.image_tag }}"
 
-  # ── 7. Summary ───────────────────────────────────────────────────────────────
+  # ════════════════════════════════════════════════════════════════════════════
+  # PRODUCTION — gated by GitHub Environment approval
+  # When auto-triggered: runs after staging succeeds.
+  # When manually targeted: runs directly (no staging prerequisite).
+  # ════════════════════════════════════════════════════════════════════════════
+
+  copy-images-production:
+    name: Copy ECR Images → production
+    runs-on: ubuntu-latest
+    needs: [guard, resolve-image-tag, smoke-test-staging]
+    if: |
+      needs.guard.outputs.run_production == 'true' &&
+      (needs.smoke-test-staging.result == 'success' || needs.smoke-test-staging.result == 'skipped')
+    outputs:
+      target_registry: ${{ steps.push.outputs.target_registry }}
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN_DEV }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Pull images from dev ECR
+        id: pull
+        run: |
+          DEV_ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
+          DEV_REGISTRY="${DEV_ACCOUNT}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com"
+          DEV_TOKEN=$(aws ecr get-login-password --region ${{ env.AWS_REGION }})
+          echo "::add-mask::${DEV_TOKEN}"
+          echo "dev_registry=${DEV_REGISTRY}" >> "$GITHUB_OUTPUT"
+          echo "${DEV_TOKEN}" | docker login --username AWS --password-stdin "${DEV_REGISTRY}"
+          TAG="${{ needs.resolve-image-tag.outputs.image_tag }}"
+          for svc in api ui transform; do
+            docker pull "${DEV_REGISTRY}/nextgen-databridge/${svc}:${TAG}"
+          done
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN_PROD }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Push images to production ECR
+        id: push
+        env:
+          DEV_REGISTRY: ${{ steps.pull.outputs.dev_registry }}
+          TAG: ${{ needs.resolve-image-tag.outputs.image_tag }}
+        run: |
+          PROD_ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
+          PROD_REGISTRY="${PROD_ACCOUNT}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com"
+          echo "target_registry=${PROD_REGISTRY}" >> "$GITHUB_OUTPUT"
+          aws ecr get-login-password --region ${{ env.AWS_REGION }} | \
+            docker login --username AWS --password-stdin "${PROD_REGISTRY}"
+          for svc in api ui transform; do
+            aws ecr describe-repositories --repository-names "nextgen-databridge/${svc}" 2>/dev/null \
+              || aws ecr create-repository --repository-name "nextgen-databridge/${svc}" \
+                   --image-scanning-configuration scanOnPush=true \
+                   --encryption-configuration encryptionType=AES256
+            docker tag "${DEV_REGISTRY}/nextgen-databridge/${svc}:${TAG}" \
+                       "${PROD_REGISTRY}/nextgen-databridge/${svc}:${TAG}"
+            docker tag "${DEV_REGISTRY}/nextgen-databridge/${svc}:${TAG}" \
+                       "${PROD_REGISTRY}/nextgen-databridge/${svc}:production"
+            docker push "${PROD_REGISTRY}/nextgen-databridge/${svc}:${TAG}"
+            docker push "${PROD_REGISTRY}/nextgen-databridge/${svc}:production"
+          done
+
+  deploy-core-production:
+    name: Deploy Core — production
+    runs-on: ubuntu-latest
+    needs: [guard, resolve-image-tag, copy-images-production]
+    if: |
+      needs.guard.outputs.run_production == 'true' &&
+      needs.copy-images-production.result == 'success'
+    environment: production       # ← GitHub approval gate
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN_PROD }}
+          aws-region: ${{ env.AWS_REGION }}
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+      - name: Ensure Terraform backend
+        run: |
+          BUCKET="${{ env.STATE_BUCKET }}"
+          if ! aws s3api head-bucket --bucket "$BUCKET" 2>/dev/null; then
+            aws s3api create-bucket --bucket "$BUCKET" --region us-east-1
+            aws s3api put-bucket-versioning --bucket "$BUCKET" \
+              --versioning-configuration Status=Enabled
+            aws s3api put-bucket-encryption --bucket "$BUCKET" \
+              --server-side-encryption-configuration \
+              '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"}}]}'
+          fi
+          if ! aws dynamodb describe-table --table-name "${{ env.LOCK_TABLE }}" --region us-east-1 2>/dev/null; then
+            aws dynamodb create-table \
+              --table-name "${{ env.LOCK_TABLE }}" --region us-east-1 \
+              --attribute-definitions AttributeName=LockID,AttributeType=S \
+              --key-schema AttributeName=LockID,KeyType=HASH \
+              --billing-mode PAY_PER_REQUEST
+            aws dynamodb wait table-exists --table-name "${{ env.LOCK_TABLE }}" --region us-east-1
+          fi
+      - name: terraform init
+        working-directory: infra/terraform/core
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ env.STATE_BUCKET }}" \
+            -backend-config="key=nextgen-databridge/production/core/terraform.tfstate" \
+            -backend-config="region=us-east-1" \
+            -backend-config="dynamodb_table=${{ env.LOCK_TABLE }}"
+      - name: terraform apply
+        working-directory: infra/terraform/core
+        env:
+          TF_VAR_db_password: ${{ secrets.DB_PASSWORD }}
+          TF_VAR_mssql_password: ${{ secrets.MSSQL_PASSWORD }}
+        run: |
+          terraform apply -auto-approve \
+            -var="environment=production" \
+            -var="aws_region=${{ env.AWS_REGION }}"
+      - name: Upload configs
+        run: |
+          ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
+          BUCKET="nextgen-databridge-pipeline-configs-production-${ACCOUNT}"
+          aws s3 cp configs/environments/production.json s3://${BUCKET}/environments/production.json 2>/dev/null || true
+          for f in configs/pipelines/*.json; do
+            aws s3 cp "$f" s3://${BUCKET}/active/$(basename "$f") 2>/dev/null || true
+          done
+
+  deploy-wwi-production:
+    name: Deploy WideWorldImporters — production
+    runs-on: ubuntu-latest
+    needs: [guard, resolve-image-tag, deploy-core-production]
+    if: |
+      needs.guard.outputs.run_production == 'true' &&
+      needs.deploy-core-production.result == 'success'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN_PROD }}
+          aws-region: ${{ env.AWS_REGION }}
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+      - name: terraform init
+        working-directory: infra/terraform/wwi
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ env.STATE_BUCKET }}" \
+            -backend-config="key=nextgen-databridge/production/wwi/terraform.tfstate" \
+            -backend-config="region=us-east-1" \
+            -backend-config="dynamodb_table=${{ env.LOCK_TABLE }}"
+      - name: terraform apply
+        working-directory: infra/terraform/wwi
+        env:
+          TF_VAR_db_password: ${{ secrets.DB_PASSWORD }}
+          TF_VAR_mssql_password: ${{ secrets.MSSQL_PASSWORD }}
+        run: |
+          terraform apply -auto-approve \
+            -var="environment=production" \
+            -var="aws_region=${{ env.AWS_REGION }}"
+
+  deploy-mwaa-production:
+    name: Deploy MWAA — production
+    runs-on: ubuntu-latest
+    needs: [guard, resolve-image-tag, deploy-core-production]
+    if: |
+      needs.guard.outputs.run_production == 'true' &&
+      needs.deploy-core-production.result == 'success'
+    outputs:
+      mwaa_url: ${{ steps.mwaa-url.outputs.url }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN_PROD }}
+          aws-region: ${{ env.AWS_REGION }}
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+      - name: terraform init
+        working-directory: infra/terraform/mwaa
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ env.STATE_BUCKET }}" \
+            -backend-config="key=nextgen-databridge/production/mwaa/terraform.tfstate" \
+            -backend-config="region=us-east-1" \
+            -backend-config="dynamodb_table=${{ env.LOCK_TABLE }}"
+      - name: terraform apply
+        working-directory: infra/terraform/mwaa
+        env:
+          TF_VAR_db_password: ${{ secrets.DB_PASSWORD }}
+          TF_VAR_mssql_password: ${{ secrets.MSSQL_PASSWORD }}
+        run: |
+          terraform apply -auto-approve \
+            -var="environment=production" \
+            -var="aws_region=${{ env.AWS_REGION }}"
+      - name: Upload DAGs
+        run: |
+          MWAA_BUCKET=$(cd infra/terraform/mwaa && terraform output -raw mwaa_bucket)
+          MWAA_BUCKET="$MWAA_BUCKET" bash airflow/deploy_to_mwaa.sh
+      - name: Get MWAA URL
+        id: mwaa-url
+        run: |
+          URL=$(aws mwaa get-environment \
+            --name "nextgen-databridge-production" \
+            --query "Environment.WebserverUrl" \
+            --output text 2>/dev/null || echo "pending")
+          echo "url=https://${URL}" >> "$GITHUB_OUTPUT"
+
+  deploy-apps-production:
+    name: "Deploy EKS Apps — production @ ${{ needs.resolve-image-tag.outputs.image_tag }}"
+    runs-on: ubuntu-latest
+    needs: [guard, resolve-image-tag, copy-images-production, deploy-core-production, deploy-mwaa-production]
+    if: |
+      needs.guard.outputs.run_production == 'true' &&
+      needs.deploy-core-production.result == 'success'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN_PROD }}
+          aws-region: ${{ env.AWS_REGION }}
+      - uses: azure/setup-kubectl@v4
+      - name: Update kubeconfig
+        run: aws eks update-kubeconfig --region ${{ env.AWS_REGION }} --name nextgen-databridge-production
+      - name: Resolve dynamic values
+        id: resolve
+        run: |
+          ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
+          REGISTRY="${ACCOUNT}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com"
+          echo "account=${ACCOUNT}"    >> "$GITHUB_OUTPUT"
+          echo "registry=${REGISTRY}" >> "$GITHUB_OUTPUT"
+          DB_SECRET=$(aws secretsmanager get-secret-value \
+            --secret-id "nextgen-databridge/connections/audit_db" \
+            --query SecretString --output text 2>/dev/null || echo '{"url":""}')
+          DB_URL=$(python3 -c "import json,sys; d=json.loads(sys.argv[1]); print(d.get('url',''))" "$DB_SECRET")
+          echo "::add-mask::${DB_URL}"
+          echo "database_url=${DB_URL}" >> "$GITHUB_OUTPUT"
+          echo "airflow_url=${{ needs.deploy-mwaa-production.outputs.mwaa_url }}" >> "$GITHUB_OUTPUT"
+          echo "duckdb_bucket=nextgen-databridge-duckdb-store-production-${ACCOUNT}"   >> "$GITHUB_OUTPUT"
+          echo "configs_bucket=nextgen-databridge-pipeline-configs-production-${ACCOUNT}" >> "$GITHUB_OUTPUT"
+      - name: Apply Kubernetes manifests
+        env:
+          IMAGE_TAG: ${{ needs.resolve-image-tag.outputs.image_tag }}
+          REGISTRY: ${{ steps.resolve.outputs.registry }}
+          ACCOUNT: ${{ steps.resolve.outputs.account }}
+          DATABASE_URL: ${{ steps.resolve.outputs.database_url }}
+          AIRFLOW_URL: ${{ steps.resolve.outputs.airflow_url }}
+          DUCKDB_BUCKET: ${{ steps.resolve.outputs.duckdb_bucket }}
+          CONFIGS_BUCKET: ${{ steps.resolve.outputs.configs_bucket }}
+        run: |
+          sed \
+            -e "s|__ACCOUNT_ID__|${ACCOUNT}|g" \
+            -e "s|__REGISTRY__|${REGISTRY}|g" \
+            -e "s|__IMAGE_TAG__|${IMAGE_TAG}|g" \
+            -e "s|__ENVIRONMENT__|production|g" \
+            -e "s|__DUCKDB_BUCKET__|${DUCKDB_BUCKET}|g" \
+            -e "s|__PIPELINE_CONFIGS_BUCKET__|${CONFIGS_BUCKET}|g" \
+            -e "s|__DATABASE_URL__|${DATABASE_URL}|g" \
+            -e "s|__AIRFLOW_URL__|${AIRFLOW_URL}|g" \
+            -e "s|__API_SECRET_KEY__|nextgen-databridge-production-${IMAGE_TAG}|g" \
+            eks/manifests/platform.yaml | kubectl apply -f -
+      - name: Wait for rollout
+        run: |
+          kubectl rollout status deployment/nextgen-databridge-api -n nextgen-databridge --timeout=300s
+          kubectl rollout status deployment/nextgen-databridge-ui  -n nextgen-databridge --timeout=180s
+      - name: Rollback on failure
+        if: failure()
+        run: |
+          kubectl rollout undo deployment/nextgen-databridge-api -n nextgen-databridge || true
+          kubectl rollout undo deployment/nextgen-databridge-ui  -n nextgen-databridge || true
+
+  smoke-test-production:
+    name: Smoke Tests — production
+    runs-on: ubuntu-latest
+    needs: [guard, resolve-image-tag, deploy-apps-production]
+    if: |
+      needs.guard.outputs.run_production == 'true' &&
+      needs.deploy-apps-production.result == 'success'
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN_PROD }}
+          aws-region: ${{ env.AWS_REGION }}
+      - uses: azure/setup-kubectl@v4
+      - name: Update kubeconfig
+        run: aws eks update-kubeconfig --region ${{ env.AWS_REGION }} --name nextgen-databridge-production
+      - name: Wait for pods ready
+        run: |
+          kubectl wait pod -n nextgen-databridge \
+            --for=condition=Ready --selector=app=nextgen-databridge-api --timeout=180s
+      - name: Health check — production API
+        run: |
+          HOST=$(kubectl get svc nextgen-databridge-api-lb -n nextgen-databridge \
+            -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "")
+          if [[ -n "$HOST" ]]; then
+            for i in {1..12}; do
+              STATUS=$(curl -sf -o /dev/null -w "%{http_code}" "http://${HOST}/health" 2>/dev/null || echo "000")
+              [[ "$STATUS" == "200" ]] && { echo "Health check passed (attempt $i)"; break; }
+              echo "Attempt $i: HTTP $STATUS — retrying in 15s..."
+              sleep 15
+            done
+            [[ "$STATUS" == "200" ]] || { echo "ERROR: production API health check failed"; exit 1; }
+          else
+            echo "LB not yet provisioned — pod-level check only"
+            kubectl get pods -n nextgen-databridge
+          fi
+
+  record-production-tag:
+    name: Record Production Image Tag
+    runs-on: ubuntu-latest
+    needs: [resolve-image-tag, smoke-test-production]
+    if: needs.smoke-test-production.result == 'success'
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN_DEV }}
+          aws-region: ${{ env.AWS_REGION }}
+      - run: |
+          aws ssm put-parameter \
+            --name "/nextgen-databridge/image-tag/production" \
+            --value "${{ needs.resolve-image-tag.outputs.image_tag }}" \
+            --type String --overwrite
+          echo "Recorded production tag: ${{ needs.resolve-image-tag.outputs.image_tag }}"
+
+  # ── Summary + notification ────────────────────────────────────────────────────
   summary:
     name: Deployment Summary
     runs-on: ubuntu-latest
-    needs: [resolve-image-tag, deploy-apps, record-image-tag]
+    needs:
+      - guard
+      - resolve-image-tag
+      - deploy-apps-staging
+      - smoke-test-staging
+      - deploy-apps-production
+      - smoke-test-production
     if: always()
     steps:
       - name: Write job summary
         run: |
-          cat >> "$GITHUB_STEP_SUMMARY" << EOF
-          ## Deployment Summary
+          STAGING_OK=$([[ "${{ needs.smoke-test-staging.result }}" == "success" ]] && echo "✅" || \
+                       [[ "${{ needs.smoke-test-staging.result }}" == "skipped" ]] && echo "⏭️ skipped" || echo "❌")
+          PROD_OK=$([[ "${{ needs.smoke-test-production.result }}" == "success" ]] && echo "✅" || \
+                    [[ "${{ needs.smoke-test-production.result }}" == "skipped" ]] && echo "⏭️ skipped" || echo "❌")
+          TRIGGER=$([[ "${{ github.event_name }}" == "workflow_run" ]] && echo "auto (after dev)" || echo "manual (@${{ github.actor }})")
+          {
+            echo "## Promotion Summary"
+            echo ""
+            echo "| Field | Value |"
+            echo "|---|---|"
+            echo "| Image Tag | \`${{ needs.resolve-image-tag.outputs.image_tag }}\` |"
+            echo "| Trigger | ${TRIGGER} |"
+            echo "| Staging | ${STAGING_OK} |"
+            echo "| Production | ${PROD_OK} |"
+          } >> "$GITHUB_STEP_SUMMARY"
 
-          | Field | Value |
-          |---|---|
-          | Environment | \`${{ inputs.environment }}\` |
-          | Image Tag | \`${{ needs.resolve-image-tag.outputs.image_tag }}\` |
-          | Source | \`${{ needs.resolve-image-tag.outputs.source_env || 'manual input' }}\` |
-          | Status | ${{ needs.deploy-apps.result == 'success' && '✅ Success' || '❌ Failed' }} |
-          | Triggered by | @${{ github.actor }} |
-          EOF
+      - name: Notify Slack
+        if: always()
+        continue-on-error: true
+        uses: slackapi/slack-github-action@v1.26.0
+        with:
+          payload: |
+            {
+              "text": "${{ needs.smoke-test-production.result == 'success' && ':rocket: *Production deployed*' || needs.smoke-test-staging.result == 'success' && ':white_check_mark: *Staging deployed*' || ':x: *Promotion failed*' }} — `${{ needs.resolve-image-tag.outputs.image_tag }}` — <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View run>"
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
