@@ -7,7 +7,7 @@ Deploy	Destroy	Does
 ./up-apps.sh dev	./down-apps.sh dev	Docker build/push + EKS deploy
 ./up.sh dev and ./down.sh dev remain as full orchestrators calling the 4 individual scripts in the correct order.
 
-
+Test
 
 up.sh	Every deploy	DB_PASSWORD=ActionDag!1 MSSQL_PASSWORD=ActionDag!1 bash up.sh
 restore-wwi.sh	First time only	MSSQL_PASSWORD=ActionDag!1 bash restore-wwi.sh
