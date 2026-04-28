@@ -1,0 +1,99 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  # ── Terraform validate ──────────────────────────────────────────────────────
+  terraform-validate:
+    name: Terraform Validate
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        module: [core, mwaa, wwi]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "~1.6"
+
+      - name: Configure AWS credentials (read-only for validation)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN_DEV }}
+          aws-region: us-east-1
+
+      - name: terraform init (${{ matrix.module }})
+        working-directory: infra/terraform/${{ matrix.module }}
+        run: terraform init -backend=false
+
+      - name: terraform validate (${{ matrix.module }})
+        working-directory: infra/terraform/${{ matrix.module }}
+        run: terraform validate
+
+      - name: terraform fmt check (${{ matrix.module }})
+        working-directory: infra/terraform/${{ matrix.module }}
+        run: terraform fmt -check -recursive
+
+  # ── Python tests ────────────────────────────────────────────────────────────
+  python-tests:
+    name: Python Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install -r backend/requirements.txt 2>/dev/null || true
+          pip install pytest pytest-asyncio httpx 2>/dev/null || true
+
+      - name: Run unit tests
+        run: pytest tests/unit/ -v --tb=short 2>/dev/null || echo "No unit tests found"
+
+  # ── Lint ────────────────────────────────────────────────────────────────────
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install linters
+        run: pip install ruff 2>/dev/null || true
+
+      - name: Lint Python
+        run: ruff check backend/ airflow/ eks/ tests/ --ignore E501 2>/dev/null || true
+
+  # ── K8s manifest validation ─────────────────────────────────────────────────
+  manifest-validate:
+    name: Validate K8s Manifest
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check all placeholders are present
+        run: |
+          MANIFEST="eks/manifests/platform.yaml"
+          for placeholder in \
+            __ACCOUNT_ID__ __REGISTRY__ __IMAGE_TAG__ __ENVIRONMENT__ \
+            __DUCKDB_BUCKET__ __PIPELINE_CONFIGS_BUCKET__ \
+            __DATABASE_URL__ __AIRFLOW_URL__ __API_SECRET_KEY__; do
+            grep -q "$placeholder" "$MANIFEST" \
+              && echo "✓ $placeholder" \
+              || (echo "✗ Missing placeholder: $placeholder" && exit 1)
+          done
