@@ -915,7 +915,7 @@ def ensure_oidc_provider(iam, account_id: str, dry_run: bool) -> str:
         print(f"  [exists]  OIDC provider: {oidc_arn}")
         return oidc_arn
     except ClientError as e:
-        if e.response["Error"]["Code"] != "NoSuchEntityException":
+        if e.response["Error"]["Code"] != "NoSuchEntity":
             raise
     if dry_run:
         print(f"  [dry-run] Would create OIDC provider for {GITHUB_OIDC_HOST}")
@@ -950,7 +950,7 @@ def ensure_role(
         print(f"  [exists]  Role: {role_arn}  (trust policy refreshed)")
         return role_arn
     except ClientError as e:
-        if e.response["Error"]["Code"] != "NoSuchEntityException":
+        if e.response["Error"]["Code"] != "NoSuchEntity":
             raise
     if dry_run:
         print(f"  [dry-run] Would create role: {role_name}")
@@ -1018,7 +1018,7 @@ def ensure_policy(
         print(f"  [updated] Policy: {policy_arn}  ({len(doc_json)} chars)")
         return policy_arn
     except ClientError as e:
-        if e.response["Error"]["Code"] != "NoSuchEntityException":
+        if e.response["Error"]["Code"] != "NoSuchEntity":
             raise
     if dry_run:
         print(f"  [dry-run] Would create policy: {name}  ({len(doc_json)} chars)")
@@ -1162,7 +1162,7 @@ def main() -> None:
         ensure_policy_attached(iam, args.role_name, arn, args.dry_run)
 
     # ── Done ──────────────────────────────────────────────────────────────────
-    print("\n" + "═" * 60)
+    print("\n" + "-" * 60)
     if args.dry_run:
         print("DRY RUN complete — no resources were created.")
     else:
@@ -1175,7 +1175,7 @@ def main() -> None:
         print(f"  Value : {role_arn}")
         print()
         print("Repeat with --env staging / production / dr to create the other roles.")
-    print("═" * 60)
+    print("-" * 60)
 
 
 if __name__ == "__main__":

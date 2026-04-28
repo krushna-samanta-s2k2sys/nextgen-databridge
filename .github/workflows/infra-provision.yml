@@ -76,6 +76,18 @@ jobs:
           echo "run_wwi=$([[ "${{ inputs.module }}"  == "wwi"  || "$ALL" == "true" ]]     \
             && echo true || echo false)"                                                  >> "$GITHUB_OUTPUT"
 
+      - name: Validate role ARN resolved
+        run: |
+          ROLE="${{ steps.cfg.outputs.role_arn }}"
+          if [[ -z "$ROLE" ]]; then
+            echo "::error::role_arn is empty for environment '${{ inputs.environment }}'."
+            echo "::error::Add the matching secret to the '${{ inputs.environment }}' GitHub Environment:"
+            echo "::error::  dev→AWS_ROLE_ARN_DEV  staging→AWS_ROLE_ARN_STAGING  production→AWS_ROLE_ARN_PROD  dr→AWS_ROLE_ARN_DR"
+            echo "::error::Go to: Settings → Environments → ${{ inputs.environment }} → Add secret"
+            exit 1
+          fi
+          echo "role_arn resolved (length ${#ROLE})"
+
   # ── Bootstrap: state bucket + DynamoDB lock table ───────────────────────────
   bootstrap:
     name: Bootstrap Terraform Backend
