@@ -46,6 +46,7 @@ jobs:
   setup:
     name: "Setup (${{ inputs.environment }} / ${{ inputs.module }} / ${{ inputs.action }})"
     runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
     outputs:
       aws_region: ${{ steps.cfg.outputs.aws_region }}
       role_arn: ${{ steps.cfg.outputs.role_arn }}
@@ -80,6 +81,7 @@ jobs:
     name: Bootstrap Terraform Backend
     runs-on: ubuntu-latest
     needs: setup
+    environment: ${{ inputs.environment }}
     steps:
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -128,6 +130,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: [setup, bootstrap]
     if: needs.setup.outputs.run_core == 'true'
+    environment: ${{ inputs.environment }}
     steps:
       - uses: actions/checkout@v4
       - uses: aws-actions/configure-aws-credentials@v4
@@ -178,6 +181,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: [setup, bootstrap]
     if: needs.setup.outputs.run_mwaa == 'true'
+    environment: ${{ inputs.environment }}
     steps:
       - uses: actions/checkout@v4
       - uses: aws-actions/configure-aws-credentials@v4
@@ -228,6 +232,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: [setup, bootstrap]
     if: needs.setup.outputs.run_wwi == 'true'
+    environment: ${{ inputs.environment }}
     steps:
       - uses: actions/checkout@v4
       - uses: aws-actions/configure-aws-credentials@v4
