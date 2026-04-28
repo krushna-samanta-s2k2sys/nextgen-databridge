@@ -1,0 +1,202 @@
+{
+  "pipeline_id": "wwi_sales_etl",
+  "version": "1.0.0",
+  "description": "WideWorldImporters daily sales ETL: extract Orders, OrderLines, Customers and Salespeople from SQL Server, apply enrichment transforms, write to TargetDB.",
+  "schedule": "0 6 * * *",
+  "retries": 3,
+  "retry_delay_minutes": 5,
+  "retry_exponential_backoff": true,
+  "sla_minutes": 60,
+  "max_active_runs": 1,
+  "catchup": false,
+  "dag_timeout_minutes": 120,
+  "owner": "data-engineering",
+  "team": "analytics",
+  "tags": ["wwi", "sales", "daily"],
+  "alerting": {
+    "on_failure": ["slack:#data-alerts", "email:data-eng@company.com"],
+    "on_sla_breach": ["slack:#data-alerts"],
+    "on_success": ["slack:#data-notifications"]
+  },
+
+  "tasks": [
+    {
+      "task_id": "extract_orders",
+      "type": "sql_extract",
+      "source": {
+        "connection": "wwi_sqlserver",
+        "query": "SELECT o.OrderID, o.CustomerID, o.SalespersonPersonID, o.OrderDate, o.ExpectedDeliveryDate, o.CustomerPurchaseOrderNumber, o.IsUndersupplyBackordered, o.Comments, o.LastEditedWhen FROM Sales.Orders o WHERE o.OrderDate >= DATEADD(day, -1, CAST('{{ ds }}' AS DATE)) AND o.OrderDate < CAST('{{ ds }}' AS DATE)",
+        "batch_size": 50000
+      },
+      "output": {
+        "duckdb_path": "s3://${duckdb_store}/pipelines/wwi_sales_etl/runs/{{ run_id }}/extract_orders.duckdb",
+        "table": "raw_orders"
+      }
+    },
+    {
+      "task_id": "extract_order_lines",
+      "type": "sql_extract",
+      "source": {
+        "connection": "wwi_sqlserver",
+        "query": "SELECT ol.OrderLineID, ol.OrderID, ol.StockItemID, ol.Description, ol.Quantity, ol.UnitPrice, ol.TaxRate, ol.PickedQuantity, ol.PickingCompletedWhen FROM Sales.OrderLines ol INNER JOIN Sales.Orders o ON ol.OrderID = o.OrderID WHERE o.OrderDate >= DATEADD(day, -1, CAST('{{ ds }}' AS DATE)) AND o.OrderDate < CAST('{{ ds }}' AS DATE)",
+        "batch_size": 100000
+      },
+      "output": {
+        "duckdb_path": "s3://${duckdb_store}/pipelines/wwi_sales_etl/runs/{{ run_id }}/extract_order_lines.duckdb",
+        "table": "raw_order_lines"
+      }
+    },
+    {
+      "task_id": "extract_customers",
+      "type": "sql_extract",
+      "source": {
+        "connection": "wwi_sqlserver",
+        "query": "SELECT c.CustomerID, c.CustomerName, c.BillToCustomerID, c.CreditLimit, c.AccountOpenedDate, c.StandardDiscountPercentage, c.IsStatementSent, c.IsOnCreditHold, c.PaymentDays, c.PhoneNumber, c.WebsiteURL FROM Sales.Customers c WHERE c.ValidTo = '9999-12-31 23:59:59.9999999'",
+        "batch_size": 10000
+      },
+      "output": {
+        "duckdb_path": "s3://${duckdb_store}/pipelines/wwi_sales_etl/runs/{{ run_id }}/extract_customers.duckdb",
+        "table": "raw_customers"
+      }
+    },
+    {
+      "task_id": "extract_salespeople",
+      "type": "sql_extract",
+      "source": {
+        "connection": "wwi_sqlserver",
+        "query": "SELECT p.PersonID, p.FullName AS SalespersonName, p.PreferredName, p.PhoneNumber, p.EmailAddress FROM Application.People p WHERE p.IsSalesperson = 1 AND p.ValidTo = '9999-12-31 23:59:59.9999999'",
+        "batch_size": 1000
+      },
+      "output": {
+        "duckdb_path": "s3://${duckdb_store}/pipelines/wwi_sales_etl/runs/{{ run_id }}/extract_salespeople.duckdb",
+        "table": "raw_salespeople"
+      }
+    },
+
+    {
+      "task_id": "validate_orders",
+      "type": "data_quality",
+      "depends_on": ["extract_orders"],
+      "source": { "table": "raw_orders" },
+      "checks": [
+        { "type": "row_count_min", "value": 1, "action": "fail", "description": "Must have at least one order for the day" },
+        { "type": "not_null", "column": "OrderID",    "action": "fail" },
+        { "type": "not_null", "column": "CustomerID", "action": "fail" },
+        { "type": "not_null", "column": "OrderDate",  "action": "fail" },
+        { "type": "unique",   "column": "OrderID",    "action": "warn" },
+        { "type": "not_null", "column": "SalespersonPersonID", "action": "warn" }
+      ],
+      "fail_pipeline_on_error": true
+    },
+    {
+      "task_id": "validate_order_lines",
+      "type": "data_quality",
+      "depends_on": ["extract_order_lines"],
+      "source": { "table": "raw_order_lines" },
+      "checks": [
+        { "type": "row_count_min", "value": 1, "action": "fail" },
+        { "type": "not_null", "column": "OrderLineID", "action": "fail" },
+        { "type": "not_null", "column": "OrderID",     "action": "fail" },
+        { "type": "not_null", "column": "StockItemID", "action": "fail" },
+        { "type": "unique",   "column": "OrderLineID", "action": "warn" },
+        { "type": "value_range", "column": "Quantity",  "min": 1,  "action": "warn" },
+        { "type": "value_range", "column": "UnitPrice", "min": 0,  "action": "fail" },
+        { "type": "value_range", "column": "TaxRate",   "min": 0, "max": 100, "action": "warn" }
+      ],
+      "fail_pipeline_on_error": true
+    },
+
+    {
+      "task_id": "transform_order_header",
+      "type": "duckdb_transform",
+      "depends_on": ["validate_orders", "extract_customers", "extract_salespeople"],
+      "sql": "SELECT o.OrderID, o.CustomerID, c.CustomerName, c.IsOnCreditHold, c.CreditLimit, c.StandardDiscountPercentage, o.SalespersonPersonID, sp.SalespersonName, o.OrderDate, o.ExpectedDeliveryDate, o.CustomerPurchaseOrderNumber, o.IsUndersupplyBackordered, o.Comments, DATEDIFF('day', o.OrderDate, o.ExpectedDeliveryDate) AS PromisedLeadDays, CURRENT_TIMESTAMP AS etl_loaded_at FROM extract_orders.raw_orders o LEFT JOIN extract_customers.raw_customers c ON o.CustomerID = c.CustomerID LEFT JOIN extract_salespeople.raw_salespeople sp ON o.SalespersonPersonID = sp.PersonID",
+      "output": {
+        "duckdb_path": "s3://${duckdb_store}/pipelines/wwi_sales_etl/runs/{{ run_id }}/transform_order_header.duckdb",
+        "table": "order_header"
+      }
+    },
+    {
+      "task_id": "transform_order_lines_detail",
+      "type": "duckdb_transform",
+      "depends_on": ["validate_order_lines"],
+      "sql": "SELECT ol.OrderLineID, ol.OrderID, ol.StockItemID, ol.Description AS StockItemDescription, ol.Quantity, ol.UnitPrice, ol.TaxRate, ROUND(ol.Quantity * ol.UnitPrice, 2) AS LineTotal, ROUND(ol.Quantity * ol.UnitPrice * ol.TaxRate / 100.0, 2) AS TaxAmount, ROUND(ol.Quantity * ol.UnitPrice * (1 + ol.TaxRate / 100.0), 2) AS LineTotalIncTax, ol.PickedQuantity, ol.Quantity - ol.PickedQuantity AS OutstandingQty, CASE WHEN ol.PickedQuantity >= ol.Quantity THEN 'FULLY_PICKED' WHEN ol.PickedQuantity > 0 THEN 'PARTIALLY_PICKED' ELSE 'NOT_PICKED' END AS PickingStatus, ol.PickingCompletedWhen, CURRENT_TIMESTAMP AS etl_loaded_at FROM extract_order_lines.raw_order_lines ol",
+      "output": {
+        "duckdb_path": "s3://${duckdb_store}/pipelines/wwi_sales_etl/runs/{{ run_id }}/transform_order_lines_detail.duckdb",
+        "table": "order_lines_detail"
+      }
+    },
+    {
+      "task_id": "transform_customer_monthly_sales",
+      "type": "duckdb_transform",
+      "depends_on": ["validate_orders", "validate_order_lines", "extract_customers"],
+      "sql": "SELECT c.CustomerID, c.CustomerName, c.IsOnCreditHold, c.CreditLimit, DATE_TRUNC('month', CAST(o.OrderDate AS TIMESTAMP)) AS OrderMonth, COUNT(DISTINCT o.OrderID) AS OrderCount, COUNT(ol.OrderLineID) AS TotalOrderLines, SUM(ol.Quantity) AS TotalUnits, ROUND(SUM(ol.Quantity * ol.UnitPrice), 2) AS TotalRevenue, ROUND(SUM(ol.Quantity * ol.UnitPrice * ol.TaxRate / 100.0), 2) AS TotalTax, ROUND(SUM(ol.Quantity * ol.UnitPrice * (1 + ol.TaxRate / 100.0)), 2) AS TotalRevIncTax, ROUND(AVG(ol.Quantity * ol.UnitPrice), 2) AS AvgLineValue, COUNT(DISTINCT ol.StockItemID) AS UniqueItemsBought, CURRENT_TIMESTAMP AS etl_loaded_at FROM extract_customers.raw_customers c INNER JOIN extract_orders.raw_orders o ON c.CustomerID = o.CustomerID INNER JOIN extract_order_lines.raw_order_lines ol ON o.OrderID = ol.OrderID GROUP BY c.CustomerID, c.CustomerName, c.IsOnCreditHold, c.CreditLimit, DATE_TRUNC('month', CAST(o.OrderDate AS TIMESTAMP))",
+      "output": {
+        "duckdb_path": "s3://${duckdb_store}/pipelines/wwi_sales_etl/runs/{{ run_id }}/transform_customer_monthly_sales.duckdb",
+        "table": "customer_monthly_sales"
+      }
+    },
+
+    {
+      "task_id": "validate_transformed",
+      "type": "data_quality",
+      "depends_on": ["transform_order_header"],
+      "source": { "table": "order_header" },
+      "checks": [
+        { "type": "row_count_min", "value": 1,    "action": "fail" },
+        { "type": "not_null", "column": "OrderID", "action": "fail" },
+        { "type": "not_null", "column": "CustomerName", "action": "warn", "description": "Orphaned orders have no customer" }
+      ],
+      "fail_pipeline_on_error": true
+    },
+
+    {
+      "task_id": "load_order_header",
+      "type": "load_target",
+      "depends_on": ["validate_transformed"],
+      "source": { "table": "order_header" },
+      "target": {
+        "type": "sqlserver",
+        "connection": "wwi_sqlserver_target",
+        "schema": "dbo",
+        "table": "OrderEnriched",
+        "mode": "append"
+      }
+    },
+    {
+      "task_id": "load_order_lines",
+      "type": "load_target",
+      "depends_on": ["transform_order_lines_detail"],
+      "source": { "table": "order_lines_detail" },
+      "target": {
+        "type": "sqlserver",
+        "connection": "wwi_sqlserver_target",
+        "schema": "dbo",
+        "table": "OrderLineDetail",
+        "mode": "append"
+      }
+    },
+    {
+      "task_id": "load_customer_monthly_sales",
+      "type": "load_target",
+      "depends_on": ["transform_customer_monthly_sales"],
+      "source": { "table": "customer_monthly_sales" },
+      "target": {
+        "type": "sqlserver",
+        "connection": "wwi_sqlserver_target",
+        "schema": "dbo",
+        "table": "CustomerMonthlySales",
+        "mode": "append"
+      }
+    },
+
+    {
+      "task_id": "notify_complete",
+      "type": "notification",
+      "depends_on": ["load_order_header", "load_order_lines", "load_customer_monthly_sales"],
+      "trigger_rule": "all_done",
+      "channels": ["slack:#data-notifications"],
+      "message": "wwi_sales_etl completed for {{ ds }} — OrderEnriched, OrderLineDetail, CustomerMonthlySales updated."
+    }
+  ]
+}

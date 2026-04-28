@@ -1,0 +1,244 @@
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: nextgen-databridge
+
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: nextgen-databridge-jobs
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: nextgen-databridge-task-runner
+  namespace: nextgen-databridge
+  annotations:
+    eks.amazonaws.com/role-arn: arn:aws:iam::__ACCOUNT_ID__:role/nextgen-databridge-task-runner
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: nextgen-databridge-task-runner
+  namespace: nextgen-databridge-jobs
+  annotations:
+    eks.amazonaws.com/role-arn: arn:aws:iam::__ACCOUNT_ID__:role/nextgen-databridge-task-runner
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: nextgen-databridge-job-manager
+rules:
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["create", "get", "list", "watch", "delete"]
+  - apiGroups: [""]
+    resources: ["pods", "pods/log"]
+    verbs: ["get", "list", "watch"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: nextgen-databridge-task-runner-binding
+subjects:
+  - kind: ServiceAccount
+    name: nextgen-databridge-task-runner
+    namespace: nextgen-databridge
+roleRef:
+  kind: ClusterRole
+  name: nextgen-databridge-job-manager
+  apiGroup: rbac.authorization.k8s.io
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nextgen-databridge-config
+  namespace: nextgen-databridge
+data:
+  DUCKDB_BUCKET: "__DUCKDB_BUCKET__"
+  PIPELINE_CONFIGS_BUCKET: "__PIPELINE_CONFIGS_BUCKET__"
+  AWS_DEFAULT_REGION: "us-east-1"
+  AIRFLOW_URL: "__AIRFLOW_URL__"
+  NEXTGEN_DATABRIDGE_API_URL: "http://nextgen-databridge-api.nextgen-databridge.svc.cluster.local:8000"
+  NEXTGEN_DATABRIDGE_ENV: "__ENVIRONMENT__"
+
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: nextgen-databridge-db-secret
+  namespace: nextgen-databridge
+type: Opaque
+stringData:
+  DATABASE_URL: "__DATABASE_URL__"
+
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: nextgen-databridge-api-secret
+  namespace: nextgen-databridge
+type: Opaque
+stringData:
+  SECRET_KEY: "__API_SECRET_KEY__"
+
+---
+# NextGenDatabridge API
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nextgen-databridge-api
+  namespace: nextgen-databridge
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: nextgen-databridge-api
+  template:
+    metadata:
+      labels:
+        app: nextgen-databridge-api
+    spec:
+      serviceAccountName: nextgen-databridge-task-runner
+      containers:
+        - name: api
+          image: __REGISTRY__/nextgen-databridge/api:__IMAGE_TAG__
+          ports:
+            - containerPort: 8000
+          envFrom:
+            - configMapRef:
+                name: nextgen-databridge-config
+            - secretRef:
+                name: nextgen-databridge-db-secret
+          env:
+            - name: SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: nextgen-databridge-api-secret
+                  key: SECRET_KEY
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "512Mi"
+            limits:
+              cpu: "1000m"
+              memory: "2Gi"
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 15
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 30
+            periodSeconds: 30
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: nextgen-databridge-api
+  namespace: nextgen-databridge
+  annotations:
+    service.beta.kubernetes.io/aws-load-balancer-type: "nlb"
+spec:
+  type: LoadBalancer
+  selector:
+    app: nextgen-databridge-api
+  ports:
+    - protocol: TCP
+      port: 80
+      targetPort: 8000
+
+---
+# NextGenDatabridge UI
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nextgen-databridge-ui
+  namespace: nextgen-databridge
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: nextgen-databridge-ui
+  template:
+    metadata:
+      labels:
+        app: nextgen-databridge-ui
+    spec:
+      containers:
+        - name: ui
+          image: __REGISTRY__/nextgen-databridge/ui:__IMAGE_TAG__
+          ports:
+            - containerPort: 3000
+          envFrom:
+            - configMapRef:
+                name: nextgen-databridge-config
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: nextgen-databridge-ui
+  namespace: nextgen-databridge
+  annotations:
+    service.beta.kubernetes.io/aws-load-balancer-type: "nlb"
+spec:
+  type: LoadBalancer
+  selector:
+    app: nextgen-databridge-ui
+  ports:
+    - protocol: TCP
+      port: 80
+      targetPort: 3000
+
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: nextgen-databridge-api-hpa
+  namespace: nextgen-databridge
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: nextgen-databridge-api
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: nextgen-databridge-api-pdb
+  namespace: nextgen-databridge
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: nextgen-databridge-api

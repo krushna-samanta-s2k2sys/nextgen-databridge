@@ -1,0 +1,43 @@
+{
+  "environment": "production",
+  "aws_region": "us-east-1",
+
+  "connections": {
+    "audit_db": {
+      "type": "postgresql",
+      "port": 5432,
+      "database": "airflow",
+      "secret_name": "nextgen-databridge/connections/audit_db"
+    },
+    "redis": {
+      "port": 6379,
+      "secret_name": "nextgen-databridge/connections/redis"
+    },
+    "wwi_sqlserver": {
+      "airflow_conn_id": "wwi_sqlserver",
+      "type": "mssql",
+      "port": 1433,
+      "database": "WideWorldImporters",
+      "secret_name": "nextgen-databridge/connections/wwi_sqlserver"
+    },
+    "wwi_sqlserver_target": {
+      "airflow_conn_id": "wwi_sqlserver_target",
+      "type": "mssql",
+      "port": 1433,
+      "database": "TargetDB",
+      "secret_name": "nextgen-databridge/connections/wwi_sqlserver_target"
+    }
+  },
+
+  "s3_buckets": {
+    "duckdb_store":     "nextgen-databridge-duckdb-store-production",
+    "pipeline_configs": "nextgen-databridge-pipeline-configs-production",
+    "artifacts":        "nextgen-databridge-artifacts-production",
+    "mwaa":             "nextgen-databridge-mwaa-production"
+  },
+
+  "eks": {
+    "cluster_name": "nextgen-databridge",
+    "namespace":    "nextgen-databridge"
+  }
+}

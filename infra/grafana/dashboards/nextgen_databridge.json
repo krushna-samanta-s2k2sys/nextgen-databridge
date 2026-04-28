@@ -1,0 +1,91 @@
+{
+  "title": "NextGenDatabridge Platform Overview",
+  "uid": "nextgen-databridge-overview",
+  "version": 1,
+  "schemaVersion": 36,
+  "refresh": "30s",
+  "panels": [
+    {
+      "id": 1,
+      "title": "Active Pipeline Runs",
+      "type": "stat",
+      "gridPos": {"h": 4, "w": 4, "x": 0, "y": 0},
+      "targets": [{
+        "datasource": "PostgreSQL",
+        "rawSql": "SELECT COUNT(*) as value FROM pipeline_runs WHERE status IN ('running','queued') AND start_time > NOW() - INTERVAL '1 hour'",
+        "format": "table"
+      }],
+      "options": {"colorMode": "background"},
+      "fieldConfig": {"defaults": {"color": {"mode": "thresholds"}, "thresholds": {"steps": [{"color": "green","value": 0},{"color":"yellow","value":5},{"color":"red","value":20}]}}}
+    },
+    {
+      "id": 2,
+      "title": "Pipeline Runs Today",
+      "type": "stat",
+      "gridPos": {"h": 4, "w": 4, "x": 4, "y": 0},
+      "targets": [{
+        "datasource": "PostgreSQL",
+        "rawSql": "SELECT COUNT(*) as value FROM pipeline_runs WHERE start_time >= CURRENT_DATE",
+        "format": "table"
+      }]
+    },
+    {
+      "id": 3,
+      "title": "Success Rate (24h)",
+      "type": "gauge",
+      "gridPos": {"h": 4, "w": 4, "x": 8, "y": 0},
+      "targets": [{
+        "datasource": "PostgreSQL",
+        "rawSql": "SELECT ROUND(100.0 * SUM(CASE WHEN status='success' THEN 1 ELSE 0 END) / NULLIF(COUNT(*),0), 1) as value FROM pipeline_runs WHERE start_time > NOW() - INTERVAL '24 hours'",
+        "format": "table"
+      }],
+      "fieldConfig": {"defaults": {"min": 0, "max": 100, "unit": "percent", "thresholds": {"steps": [{"color":"red","value":0},{"color":"yellow","value":85},{"color":"green","value":95}]}}}
+    },
+    {
+      "id": 4,
+      "title": "Active Alerts",
+      "type": "stat",
+      "gridPos": {"h": 4, "w": 4, "x": 12, "y": 0},
+      "targets": [{
+        "datasource": "PostgreSQL",
+        "rawSql": "SELECT COUNT(*) as value FROM alerts WHERE is_resolved = false AND fired_at > NOW() - INTERVAL '24 hours'",
+        "format": "table"
+      }],
+      "fieldConfig": {"defaults": {"thresholds": {"steps": [{"color":"green","value":0},{"color":"yellow","value":1},{"color":"red","value":5}]}}}
+    },
+    {
+      "id": 5,
+      "title": "Pipeline Runs Per Hour",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 4},
+      "targets": [{
+        "datasource": "PostgreSQL",
+        "rawSql": "SELECT date_trunc('hour', start_time) as time, COUNT(*) as value, SUM(CASE WHEN status='success' THEN 1 ELSE 0 END) as success FROM pipeline_runs WHERE start_time > NOW() - INTERVAL '24 hours' GROUP BY 1 ORDER BY 1",
+        "format": "time_series"
+      }]
+    },
+    {
+      "id": 6,
+      "title": "Rows Processed Per Hour",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 4},
+      "targets": [{
+        "datasource": "PostgreSQL",
+        "rawSql": "SELECT date_trunc('hour', start_time) as time, COALESCE(SUM(total_rows_processed),0) as value FROM pipeline_runs WHERE start_time > NOW() - INTERVAL '24 hours' GROUP BY 1 ORDER BY 1",
+        "format": "time_series"
+      }],
+      "fieldConfig": {"defaults": {"unit": "short"}}
+    },
+    {
+      "id": 7,
+      "title": "Failed Tasks (Last 24h)",
+      "type": "table",
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 12},
+      "targets": [{
+        "datasource": "PostgreSQL",
+        "rawSql": "SELECT pipeline_id, task_id, task_type, error_message, start_time FROM task_runs WHERE status='failed' AND start_time > NOW() - INTERVAL '24 hours' ORDER BY start_time DESC LIMIT 50",
+        "format": "table"
+      }]
+    }
+  ]
+}

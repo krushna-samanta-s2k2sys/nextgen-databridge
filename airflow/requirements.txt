@@ -1,0 +1,6 @@
+--constraint "https://raw.githubusercontent.com/apache/airflow/constraints-2.9.2/constraints-3.11.txt"
+
+duckdb==1.0.0
+pandas
+pymssql
+kafka-python
