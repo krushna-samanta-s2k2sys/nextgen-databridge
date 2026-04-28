@@ -1,0 +1,297 @@
+name: Deploy — Dev
+
+on:
+  push:
+    branches: [main]
+
+# Only one dev deployment runs at a time; new push cancels the in-flight one.
+concurrency:
+  group: deploy-dev
+  cancel-in-progress: true
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  ENVIRONMENT: dev
+  AWS_REGION: us-east-1
+  TF_VAR_db_password: "ActionDag!1"
+  TF_VAR_mssql_password: "ActionDag!1"
+
+jobs:
+  # ── 1. Build & push images ──────────────────────────────────────────────────
+  build:
+    name: Build & Push Images
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.tag.outputs.image_tag }}
+      registry: ${{ steps.ecr-login.outputs.registry }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN_DEV }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Set image tag
+        id: tag
+        run: echo "image_tag=sha-${{ github.sha }}" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build & push API
+        uses: docker/build-push-action@v5
+        with:
+          context: ./backend
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ steps.ecr-login.outputs.registry }}/nextgen-databridge/api:sha-${{ github.sha }}
+            ${{ steps.ecr-login.outputs.registry }}/nextgen-databridge/api:dev
+            ${{ steps.ecr-login.outputs.registry }}/nextgen-databridge/api:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build & push UI
+        uses: docker/build-push-action@v5
+        with:
+          context: ./frontend
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ steps.ecr-login.outputs.registry }}/nextgen-databridge/ui:sha-${{ github.sha }}
+            ${{ steps.ecr-login.outputs.registry }}/nextgen-databridge/ui:dev
+            ${{ steps.ecr-login.outputs.registry }}/nextgen-databridge/ui:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build & push Transform
+        uses: docker/build-push-action@v5
+        with:
+          context: ./eks/jobs
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ steps.ecr-login.outputs.registry }}/nextgen-databridge/transform:sha-${{ github.sha }}
+            ${{ steps.ecr-login.outputs.registry }}/nextgen-databridge/transform:dev
+            ${{ steps.ecr-login.outputs.registry }}/nextgen-databridge/transform:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ── 2. Core infrastructure ──────────────────────────────────────────────────
+  deploy-core:
+    name: Deploy Core Infrastructure
+    runs-on: ubuntu-latest
+    needs: [build]
+    environment: dev
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN_DEV }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "~1.6"
+
+      - name: Ensure Terraform state bucket
+        run: |
+          BUCKET="nextgen-databridge-terraform-state"
+          if ! aws s3api head-bucket --bucket "$BUCKET" 2>/dev/null; then
+            aws s3api create-bucket --bucket "$BUCKET" --region ${{ env.AWS_REGION }}
+            aws s3api put-bucket-versioning \
+              --bucket "$BUCKET" \
+              --versioning-configuration Status=Enabled
+          fi
+
+      - name: terraform init
+        working-directory: infra/terraform/core
+        run: terraform init
+
+      - name: terraform apply
+        working-directory: infra/terraform/core
+        run: |
+          terraform apply -auto-approve \
+            -var="environment=${{ env.ENVIRONMENT }}"
+
+      - name: Upload environment config
+        run: |
+          aws s3 cp configs/environments/${{ env.ENVIRONMENT }}.json \
+            s3://nextgen-databridge-pipeline-configs-${{ env.ENVIRONMENT }}/environments/${{ env.ENVIRONMENT }}.json
+
+      - name: Upload pipeline configs
+        run: |
+          for f in configs/pipelines/*.json; do
+            aws s3 cp "$f" \
+              s3://nextgen-databridge-pipeline-configs-${{ env.ENVIRONMENT }}/active/$(basename "$f")
+          done
+
+  # ── 3. WideWorldImporters ───────────────────────────────────────────────────
+  deploy-wwi:
+    name: Deploy WideWorldImporters SQL Server
+    runs-on: ubuntu-latest
+    needs: [deploy-core]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN_DEV }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "~1.6"
+
+      - name: terraform init
+        working-directory: infra/terraform/wwi
+        run: terraform init
+
+      - name: terraform apply
+        working-directory: infra/terraform/wwi
+        run: |
+          terraform apply -auto-approve \
+            -var="environment=${{ env.ENVIRONMENT }}"
+
+  # ── 4. MWAA ─────────────────────────────────────────────────────────────────
+  deploy-mwaa:
+    name: Deploy MWAA Airflow
+    runs-on: ubuntu-latest
+    needs: [deploy-core]
+    outputs:
+      mwaa_bucket: ${{ steps.tf-out.outputs.mwaa_bucket }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN_DEV }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "~1.6"
+
+      - name: terraform init
+        working-directory: infra/terraform/mwaa
+        run: terraform init
+
+      - name: terraform apply
+        working-directory: infra/terraform/mwaa
+        run: |
+          terraform apply -auto-approve \
+            -var="environment=${{ env.ENVIRONMENT }}"
+
+      - name: Get MWAA bucket
+        id: tf-out
+        working-directory: infra/terraform/mwaa
+        run: echo "mwaa_bucket=$(terraform output -raw mwaa_bucket)" >> "$GITHUB_OUTPUT"
+
+      - name: Upload DAGs
+        run: MWAA_BUCKET=${{ steps.tf-out.outputs.mwaa_bucket }} bash airflow/deploy_to_mwaa.sh
+
+  # ── 5. EKS applications ─────────────────────────────────────────────────────
+  deploy-apps:
+    name: Deploy EKS Applications
+    runs-on: ubuntu-latest
+    needs: [build, deploy-core, deploy-mwaa]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN_DEV }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v4
+
+      - name: Update kubeconfig
+        run: aws eks update-kubeconfig --region ${{ env.AWS_REGION }} --name nextgen-databridge
+
+      - name: Resolve dynamic values
+        id: resolve
+        run: |
+          ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
+          echo "account=${ACCOUNT}" >> "$GITHUB_OUTPUT"
+          echo "registry=${ACCOUNT}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com" >> "$GITHUB_OUTPUT"
+
+          DB_SECRET=$(aws secretsmanager get-secret-value \
+            --secret-id "nextgen-databridge/connections/audit_db" \
+            --query SecretString --output text)
+          DB_URL=$(python3 -c "import json,sys; d=json.loads(sys.argv[1]); print(d['url'])" "$DB_SECRET")
+          echo "database_url=${DB_URL}" >> "$GITHUB_OUTPUT"
+
+          MWAA_URL=$(aws mwaa get-environment \
+            --name nextgen-databridge \
+            --query "Environment.WebserverUrl" \
+            --output text 2>/dev/null || echo "pending")
+          echo "airflow_url=https://${MWAA_URL}" >> "$GITHUB_OUTPUT"
+
+      - name: Apply Kubernetes manifests
+        env:
+          IMAGE_TAG: ${{ needs.build.outputs.image_tag }}
+          REGISTRY: ${{ steps.resolve.outputs.registry }}
+          ACCOUNT: ${{ steps.resolve.outputs.account }}
+          DATABASE_URL: ${{ steps.resolve.outputs.database_url }}
+          AIRFLOW_URL: ${{ steps.resolve.outputs.airflow_url }}
+        run: |
+          sed \
+            -e "s|__ACCOUNT_ID__|${ACCOUNT}|g" \
+            -e "s|__REGISTRY__|${REGISTRY}|g" \
+            -e "s|__IMAGE_TAG__|${IMAGE_TAG}|g" \
+            -e "s|__ENVIRONMENT__|${{ env.ENVIRONMENT }}|g" \
+            -e "s|__DUCKDB_BUCKET__|nextgen-databridge-duckdb-store-${{ env.ENVIRONMENT }}|g" \
+            -e "s|__PIPELINE_CONFIGS_BUCKET__|nextgen-databridge-pipeline-configs-${{ env.ENVIRONMENT }}|g" \
+            -e "s|__DATABASE_URL__|${DATABASE_URL}|g" \
+            -e "s|__AIRFLOW_URL__|${AIRFLOW_URL}|g" \
+            -e "s|__API_SECRET_KEY__|nextgen-databridge-${{ env.ENVIRONMENT }}-${{ github.sha }}|g" \
+            eks/manifests/platform.yaml | kubectl apply -f -
+
+      - name: Wait for rollout
+        run: |
+          kubectl rollout status deployment/nextgen-databridge-api \
+            -n nextgen-databridge --timeout=180s
+          kubectl rollout status deployment/nextgen-databridge-ui \
+            -n nextgen-databridge --timeout=120s
+
+      - name: Print endpoints
+        run: |
+          kubectl get svc -n nextgen-databridge \
+            -o custom-columns='NAME:.metadata.name,EXTERNAL-IP:.status.loadBalancer.ingress[0].hostname,PORT:.spec.ports[0].port' \
+            2>/dev/null || true
+
+  # ── 6. Record image tag in SSM for promotion ─────────────────────────────────
+  record-image-tag:
+    name: Record Image Tag
+    runs-on: ubuntu-latest
+    needs: [build, deploy-apps]
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN_DEV }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Write image tag to SSM
+        run: |
+          aws ssm put-parameter \
+            --name "/nextgen-databridge/image-tag/dev" \
+            --value "${{ needs.build.outputs.image_tag }}" \
+            --type String \
+            --overwrite
+          echo "Recorded image tag: ${{ needs.build.outputs.image_tag }}"
