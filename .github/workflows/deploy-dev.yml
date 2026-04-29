@@ -1,18 +1,23 @@
 name: Deploy — Dev
 
-# Auto-deploys every push to main. Builds images, applies all Terraform modules,
-# deploys to EKS, runs smoke tests, and records the image tag for promotion.
+# Fires on PR merge to main (automatic) or manually via workflow_dispatch.
 #
-# Required GitHub Secrets:
-#   AWS_ROLE_ARN_DEV, DB_PASSWORD, MSSQL_PASSWORD
+# Required repository secrets (Settings → Secrets and variables → Actions):
+#   DB_PASSWORD, MSSQL_PASSWORD
 #   SLACK_WEBHOOK_URL (optional — omit to skip Slack notifications)
 
 on:
   pull_request:
     branches: [main]
     types: [closed]
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: "Reason for manual deploy (for audit trail)"
+        required: false
+        default: "Manual on-demand deploy"
 
-# Cancel an in-flight dev deployment when a newer commit lands.
+# Cancel an in-flight dev deployment when a newer one is triggered.
 concurrency:
   group: deploy-dev
   cancel-in-progress: true
@@ -30,13 +35,16 @@ env:
   CLUSTER_NAME: nextgen-databridge-dev
 
 jobs:
-  # ── Guard: skip everything if the PR was closed without merging ──────────────
+  # ── Guard: pass through on merge; always pass on manual dispatch ─────────────
   guard:
-    name: Check PR Merged
+    name: Check Trigger
     runs-on: ubuntu-latest
-    if: github.event.pull_request.merged == true
+    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.merged == true
     steps:
-      - run: echo "PR #${{ github.event.pull_request.number }} merged — deploying to dev"
+      - if: github.event_name == 'workflow_dispatch'
+        run: echo "Manual deploy triggered — ${{ inputs.reason }}"
+      - if: github.event_name == 'pull_request'
+        run: echo "PR #${{ github.event.pull_request.number }} merged — deploying to dev"
 
   # ── 1. Build & push all images (parallel matrix) ────────────────────────────
   build:
