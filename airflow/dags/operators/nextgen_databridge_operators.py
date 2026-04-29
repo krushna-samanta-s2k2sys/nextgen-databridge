@@ -1272,6 +1272,7 @@ class EKSJobOperator(NextGenDatabridgeBaseOperator):
                                 k8s_client.V1Container(
                                     name="transform",
                                     image=self.image,
+                                    image_pull_policy="Always",
                                     env=env,
                                     resources=k8s_client.V1ResourceRequirements(
                                         requests={"cpu": self.cpu_request, "memory": self.memory_request},
