@@ -7,17 +7,15 @@ import { Sidebar } from './components/Sidebar'
 import { useStore } from './store/useStore'
 import { useWebSocket } from './hooks/useWebSocket'
 import { me, login } from './api/client'
-import { Button, Spinner } from './components/ui'
+import { Spinner } from './components/ui'
 
 import Dashboard from './pages/Dashboard'
-import Pipelines from './pages/Pipelines'
-import PipelineDetail from './pages/PipelineDetail'
+import { ConfiguredPipelines, PipelineConfigDetail } from './pages/ConfiguredPipelines'
 import { Runs, RunDetail } from './pages/Runs'
-import { Tasks, Alerts, AuditTrail, Connections } from './pages/TasksAlertsAuditConnections'
-import { Deployments, QueryExplorer, EKSJobs } from './pages/DeploymentsQueryEKS'
+import QueryEditor from './pages/QueryEditor'
 
 const qc = new QueryClient({
-  defaultOptions: { queries: { retry: 1, staleTime: 5_000 } },
+  defaultOptions: { queries: { retry: 1, staleTime: 10_000 } },
 })
 
 // ── Login Page ────────────────────────────────────────────────────────────────
@@ -55,8 +53,8 @@ function LoginPage() {
             <Zap size={20} className="text-white" />
           </div>
           <div>
-            <h1 className="text-lg font-bold text-zinc-100 leading-tight">NextGenDatabridge Platform</h1>
-            <p className="text-xs text-zinc-600">Enterprise Data Pipeline Management</p>
+            <h1 className="text-lg font-bold text-zinc-100 leading-tight">NextGenDatabridge</h1>
+            <p className="text-xs text-zinc-600">Monitor &amp; Explore</p>
           </div>
         </div>
 
@@ -134,35 +132,25 @@ function AppShell() {
       <Sidebar />
       <main className="flex-1 overflow-hidden">
         <Routes>
-          <Route path="/"              element={<Dashboard />} />
-          <Route path="/pipelines"     element={<Pipelines />} />
-          <Route path="/pipelines/:id" element={<PipelineDetail />} />
-          <Route path="/runs"          element={<Runs />} />
-          <Route path="/runs/:runId"   element={<RunDetail />} />
-          <Route path="/tasks"         element={<Tasks />} />
-          <Route path="/alerts"        element={<Alerts />} />
-          <Route path="/audit"         element={<AuditTrail />} />
-          <Route path="/connections"   element={<Connections />} />
-          <Route path="/deployments"   element={<Deployments />} />
-          <Route path="/query"         element={<QueryExplorer />} />
-          <Route path="/eks"           element={<EKSJobs />} />
-          <Route path="*"              element={<Navigate to="/" />} />
+          <Route path="/"                element={<Dashboard />} />
+          <Route path="/pipelines"       element={<ConfiguredPipelines />} />
+          <Route path="/pipelines/:id"   element={<PipelineConfigDetail />} />
+          <Route path="/runs"            element={<Runs />} />
+          <Route path="/runs/:runId"     element={<RunDetail />} />
+          <Route path="/query"           element={<QueryEditor />} />
+          <Route path="*"               element={<Navigate to="/" />} />
         </Routes>
       </main>
     </div>
   )
 }
 
-// ── Root App ──────────────────────────────────────────────────────────────────
 function InnerApp() {
   const { token } = useStore()
   return (
     <Routes>
       <Route path="/login" element={token ? <Navigate to="/" replace /> : <LoginPage />} />
-      <Route
-        path="/*"
-        element={token ? <AppShell /> : <Navigate to="/login" replace />}
-      />
+      <Route path="/*"     element={token ? <AppShell /> : <Navigate to="/login" replace />} />
     </Routes>
   )
 }

@@ -17,6 +17,12 @@ from sqlalchemy.orm import DeclarativeBase, relationship, Mapped, mapped_column
 from sqlalchemy.sql import func
 
 
+def _enum_col(enum_cls, **kwargs):
+    """Create an Enum column using enum VALUES (lowercase) not names (uppercase).
+    Prevents create_all() from storing enum names as PostgreSQL labels."""
+    return Enum(enum_cls, values_callable=lambda e: [m.value for m in e], **kwargs)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Base
 # ─────────────────────────────────────────────────────────────────────────────
@@ -64,6 +70,8 @@ class TaskType(PyEnum):
     PUBSUB_CONSUME = "pubsub_consume"
     PUBSUB_PUBLISH = "pubsub_publish"
     EKS_JOB = "eks_job"
+    EKS_EXTRACT = "eks_extract"
+    EKS_TRANSFORM = "eks_transform"
     PYTHON_CALLABLE = "python_callable"
     CONDITIONAL_BRANCH = "conditional_branch"
     LOAD_TARGET = "load_target"
@@ -171,7 +179,7 @@ class Pipeline(Base):
     pipeline_id: Mapped[str] = mapped_column(String(200), unique=True, nullable=False, index=True)
     name: Mapped[str] = mapped_column(String(500), nullable=False)
     description: Mapped[Optional[str]] = mapped_column(Text)
-    status: Mapped[PipelineStatus] = mapped_column(Enum(PipelineStatus), default=PipelineStatus.ACTIVE)
+    status: Mapped[PipelineStatus] = mapped_column(_enum_col(PipelineStatus), default=PipelineStatus.ACTIVE)
     current_version: Mapped[Optional[str]] = mapped_column(String(50))
     schedule: Mapped[Optional[str]] = mapped_column(String(100))
     source_type: Mapped[Optional[str]] = mapped_column(String(100))
@@ -200,7 +208,7 @@ class PipelineRun(Base):
     pipeline_version: Mapped[Optional[str]] = mapped_column(String(50))
     airflow_dag_id: Mapped[Optional[str]] = mapped_column(String(500))
     airflow_run_id: Mapped[Optional[str]] = mapped_column(String(500))
-    status: Mapped[RunStatus] = mapped_column(Enum(RunStatus), default=RunStatus.QUEUED, index=True)
+    status: Mapped[RunStatus] = mapped_column(_enum_col(RunStatus), default=RunStatus.QUEUED, index=True)
     trigger_type: Mapped[str] = mapped_column(String(50), default="scheduled")  # scheduled, manual, api
     triggered_by: Mapped[Optional[str]] = mapped_column(String(200))
     config_snapshot: Mapped[Optional[dict]] = mapped_column(JSONB)  # Config at time of run
@@ -233,8 +241,8 @@ class TaskRun(Base):
     run_id: Mapped[str] = mapped_column(String(500), ForeignKey("pipeline_runs.run_id"), nullable=False, index=True)
     pipeline_id: Mapped[str] = mapped_column(String(200), nullable=False, index=True)
     task_id: Mapped[str] = mapped_column(String(200), nullable=False)
-    task_type: Mapped[TaskType] = mapped_column(Enum(TaskType))
-    status: Mapped[TaskStatus] = mapped_column(Enum(TaskStatus), default=TaskStatus.PENDING)
+    task_type: Mapped[TaskType] = mapped_column(_enum_col(TaskType), nullable=True)
+    status: Mapped[TaskStatus] = mapped_column(_enum_col(TaskStatus), default=TaskStatus.PENDING)
     attempt_number: Mapped[int] = mapped_column(Integer, default=1)
     max_attempts: Mapped[int] = mapped_column(Integer, default=3)
 
@@ -292,7 +300,7 @@ class AuditLog(Base):
     __tablename__ = "audit_logs"
 
     id: Mapped[str] = mapped_column(UUID(as_uuid=False), primary_key=True, default=lambda: str(uuid.uuid4()))
-    event_type: Mapped[AuditEventType] = mapped_column(Enum(AuditEventType), nullable=False, index=True)
+    event_type: Mapped[AuditEventType] = mapped_column(_enum_col(AuditEventType), nullable=False, index=True)
     pipeline_id: Mapped[Optional[str]] = mapped_column(String(200), index=True)
     run_id: Mapped[Optional[str]] = mapped_column(String(500), index=True)
     task_id: Mapped[Optional[str]] = mapped_column(String(200))
@@ -301,7 +309,7 @@ class AuditLog(Base):
     details: Mapped[Optional[dict]] = mapped_column(JSONB)
     old_value: Mapped[Optional[dict]] = mapped_column(JSONB)
     new_value: Mapped[Optional[dict]] = mapped_column(JSONB)
-    severity: Mapped[AlertSeverity] = mapped_column(Enum(AlertSeverity), default=AlertSeverity.INFO)
+    severity: Mapped[AlertSeverity] = mapped_column(_enum_col(AlertSeverity), default=AlertSeverity.INFO)
     timestamp: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     correlation_id: Mapped[Optional[str]] = mapped_column(String(200))
 
@@ -321,7 +329,7 @@ class DataConnection(Base):
     id: Mapped[str] = mapped_column(UUID(as_uuid=False), primary_key=True, default=lambda: str(uuid.uuid4()))
     connection_id: Mapped[str] = mapped_column(String(200), unique=True, nullable=False, index=True)
     name: Mapped[str] = mapped_column(String(500), nullable=False)
-    connection_type: Mapped[ConnectionType] = mapped_column(Enum(ConnectionType), nullable=False)
+    connection_type: Mapped[ConnectionType] = mapped_column(_enum_col(ConnectionType), nullable=False)
     host: Mapped[Optional[str]] = mapped_column(String(500))
     port: Mapped[Optional[int]] = mapped_column(Integer)
     database: Mapped[Optional[str]] = mapped_column(String(200))
@@ -348,7 +356,7 @@ class Alert(Base):
 
     id: Mapped[str] = mapped_column(UUID(as_uuid=False), primary_key=True, default=lambda: str(uuid.uuid4()))
     alert_type: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
-    severity: Mapped[AlertSeverity] = mapped_column(Enum(AlertSeverity), nullable=False, index=True)
+    severity: Mapped[AlertSeverity] = mapped_column(_enum_col(AlertSeverity), nullable=False, index=True)
     title: Mapped[str] = mapped_column(String(500), nullable=False)
     message: Mapped[str] = mapped_column(Text, nullable=False)
     pipeline_id: Mapped[Optional[str]] = mapped_column(String(200), index=True)
@@ -390,8 +398,8 @@ class Deployment(Base):
     pipeline_id: Mapped[str] = mapped_column(String(200), nullable=False, index=True)
     version: Mapped[str] = mapped_column(String(50), nullable=False)
     deployment_type: Mapped[str] = mapped_column(String(50), nullable=False)  # config, code, container, full
-    environment: Mapped[DeploymentEnvironment] = mapped_column(Enum(DeploymentEnvironment), nullable=False)
-    status: Mapped[DeploymentStatus] = mapped_column(Enum(DeploymentStatus), default=DeploymentStatus.DRAFT, index=True)
+    environment: Mapped[DeploymentEnvironment] = mapped_column(_enum_col(DeploymentEnvironment), nullable=False)
+    status: Mapped[DeploymentStatus] = mapped_column(_enum_col(DeploymentStatus), default=DeploymentStatus.DRAFT, index=True)
     change_description: Mapped[Optional[str]] = mapped_column(Text)
     config_diff: Mapped[Optional[dict]] = mapped_column(JSONB)
     container_image: Mapped[Optional[str]] = mapped_column(String(500))

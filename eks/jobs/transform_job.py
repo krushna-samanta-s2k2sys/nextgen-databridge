@@ -316,6 +316,8 @@ def main():
     input_paths    = json.loads(os.getenv("INPUT_PATHS", "{}"))
     task_config    = json.loads(os.getenv("TASK_CONFIG", "{}"))
     operation_type = os.getenv("OPERATION_TYPE", "transform")
+    # Map operation type to the tasktype enum values defined in models.py
+    task_type_val  = "eks_extract" if operation_type == "extract" else "eks_transform"
     task_run_id    = f"{run_id}_{task_id}_attempt1"
 
     if not all([pipeline_id, run_id, task_id, output_path]):
@@ -328,7 +330,7 @@ def main():
     write_task_run(
         "running",
         task_run_id=task_run_id, run_id=run_id, pipeline_id=pipeline_id,
-        task_id=task_id, task_type=f"eks_{operation_type}", start_time=start_time,
+        task_id=task_id, task_type=task_type_val, start_time=start_time,
     )
 
     try:
@@ -344,7 +346,7 @@ def main():
         write_task_run(
             "success",
             task_run_id=task_run_id, run_id=run_id, pipeline_id=pipeline_id,
-            task_id=task_id, task_type=f"eks_{operation_type}",
+            task_id=task_id, task_type=task_type_val,
             start_time=start_time, end_time=end_time, duration_seconds=duration,
             output_duckdb_path=output_path, output_table=output_table,
             output_row_count=row_count, output_size_bytes=size_bytes,
@@ -358,7 +360,7 @@ def main():
         write_task_run(
             "failed",
             task_run_id=task_run_id, run_id=run_id, pipeline_id=pipeline_id,
-            task_id=task_id, task_type=f"eks_{operation_type}",
+            task_id=task_id, task_type=task_type_val,
             start_time=start_time, end_time=end_time, duration_seconds=duration,
             error_message=str(e)[:2000], error_traceback=traceback.format_exc()[:5000],
         )
