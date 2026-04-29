@@ -3,7 +3,7 @@ FROM python:3.11-slim
 WORKDIR /app
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    gcc libpq-dev curl \
+    gcc libpq-dev curl freetds-dev freetds-bin \
     && rm -rf /var/lib/apt/lists/*
 
 RUN pip install --no-cache-dir \
@@ -12,6 +12,7 @@ RUN pip install --no-cache-dir \
     pandas==2.2.2 \
     pyarrow==16.0.0 \
     psycopg2-binary==2.9.9 \
+    pymssql==2.3.0 \
     sqlalchemy==2.0.30
 
 COPY transform_job.py .

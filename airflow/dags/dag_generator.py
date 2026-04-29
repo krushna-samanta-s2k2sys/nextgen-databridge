@@ -91,9 +91,15 @@ def _make_task(task_config: dict, dag: DAG, pipeline_config: dict):
     Factory: create the right Airflow operator from a task config dict.
     Returns an Airflow BaseOperator subclass instance.
     """
-    task_id   = task_config["task_id"]
-    task_type = task_config["type"]
-    execution = task_config.get("execution", {})
+    task_id       = task_config["task_id"]
+    task_type     = task_config["type"]
+    original_type = task_type
+    execution     = task_config.get("execution", {})
+
+    # Route to EKS when the task sets "engine": "eks" but isn't already eks_job.
+    # The container dispatches on OPERATION_TYPE so the same image handles both.
+    if task_config.get("engine") == "eks" and task_type != "eks_job":
+        task_type = "eks_job"
 
     # Common kwargs passed to every operator
     common_kwargs = dict(
@@ -151,6 +157,16 @@ def _make_task(task_config: dict, dag: DAG, pipeline_config: dict):
 
     # EKS job gets additional k8s parameters
     if task_type == "eks_job":
+        # Determine what the container should do:
+        #   extract tasks  -> OPERATION_TYPE=extract  (stream DB rows to Parquet on S3)
+        #   everything else -> OPERATION_TYPE=transform (DuckDB SQL on staged files)
+        operation_type = (
+            "extract" if original_type in ("sql_extract", "cdc_extract") else "transform"
+        )
+        eks_env = {
+            **execution.get("env_vars", {}),
+            "OPERATION_TYPE": operation_type,
+        }
         common_kwargs.update({
             "image": execution.get("image", f"nextgen-databridge/transform:{pipeline_config.get('version', 'latest')}"),
             "cpu_request": execution.get("cpu", "1"),
@@ -160,7 +176,7 @@ def _make_task(task_config: dict, dag: DAG, pipeline_config: dict):
             "namespace": execution.get("namespace", "nextgen-databridge-jobs"),
             "eks_cluster_name": os.getenv("EKS_CLUSTER_NAME", "nextgen-databridge-eks"),
             "service_account": execution.get("service_account", "nextgen-databridge-task-runner"),
-            "env_vars": execution.get("env_vars", {}),
+            "env_vars": eks_env,
         })
 
     OperatorClass = OPERATOR_MAP.get(task_type)

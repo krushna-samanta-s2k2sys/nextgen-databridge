@@ -1,214 +1,214 @@
-
-<!-- Script	When to run	Command
-Deploy	Destroy	Does
-./up-core.sh dev	./down-core.sh dev	Core infra + uploads env/pipeline configs
-./up-wwi.sh dev	./down-wwi.sh dev	SQL Server + optional WWI restore
-./up-mwaa.sh dev	./down-mwaa.sh dev	MWAA + DAG upload
-./up-apps.sh dev	./down-apps.sh dev	Docker build/push + EKS deploy
-./up.sh dev and ./down.sh dev remain as full orchestrators calling the 4 individual scripts in the correct order.
-
-Test
-
-up.sh	Every deploy	DB_PASSWORD=ActionDag!1 MSSQL_PASSWORD=ActionDag!1 bash up.sh
-restore-wwi.sh	First time only	MSSQL_PASSWORD=ActionDag!1 bash restore-wwi.sh
-down.sh	Teardown	DB_PASSWORD=ActionDag!1 MSSQL_PASSWORD=ActionDag!1 bash down.sh -->
-
-$env:DB_PASSWORD="ActionDag!1"; $env:MSSQL_PASSWORD="ActionDag!1"; bash ./down.sh
-
-<!-- # 1. Provision everything
-cd infra/terraform
-terraform apply -var mssql_password=ActionDag!1 -var db_password=ActionDag!1
-
-# 2. Restore WideWorldImporters
-cd ../scripts
-./restore_wwi.sh $(terraform -chdir=../terraform output -raw sqlserver_endpoint) ActionDag!1
-
-# 3. Deploy DAGs + plugins to MWAA
-MWAA_BUCKET=$(terraform -chdir=infra/terraform output -raw mwaa_bucket) ./airflow/deploy_to_mwaa.sh
-
-# 4. Tear down (when done)
-cd infra/terraform && ./destroy.sh -->
-
-<!-- API	http://a31c9466fdd1a477f9ac707114bc62fd-00de8610e187c14e.elb.us-east-1.amazonaws.com
-API Docs (Swagger)	http://a31c9466fdd1a477f9ac707114bc62fd-00de8610e187c14e.elb.us-east-1.amazonaws.com/api/docs
-UI	http://a3b258c43e3db4e38a8ec35d7c706117-a7780732535836a6.elb.us-east-1.amazonaws.com -->
 # NextGenDatabridge Platform
 
-A production-grade, modern **ELT pipeline platform** built on Apache Airflow, DuckDB, FastAPI, and React. Orchestrate complex data pipelines from SQL Server, Oracle, Kafka, Pub/Sub, and file sources to any target — with full audit trails, data quality checks, deployment approvals, and a live admin UI.
+A production-grade **ELT pipeline platform** built on Apache Airflow (MWAA), DuckDB, FastAPI, and React. Orchestrate complex data pipelines from SQL Server, Oracle, Kafka, Pub/Sub, and file sources to any target — with full audit trails, data quality checks, deployment approvals, and a live admin UI.
 
 ---
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                   NextGenDatabridge Platform                      │
-├──────────────┬──────────────────────┬────────────────────────────┤
-│  Admin UI    │   FastAPI Backend    │   Apache Airflow           │
-│  (React)     │   (REST + WebSocket) │   (CeleryExecutor)         │
-│  :3000       │   :8000              │   :8080                    │
-├──────────────┴──────────────────────┴────────────────────────────┤
-│              PostgreSQL (Audit DB + Airflow DB)                  │
-│              Redis (Celery broker)                               │
-│              S3 / LocalStack (DuckDB store + configs)            │
-├──────────────────────────────────────────────────────────────────┤
-│  Pipeline Execution: Airflow DAGs → Custom Operators             │
-│  Heavy Tasks: EKS Kubernetes Jobs (transform_job.py)             │
-│  Monitoring: Prometheus + Grafana                                │
-└──────────────────────────────────────────────────────────────────┘
+                        ┌─────────────────────────────────────────────────────┐
+                        │                     AWS (us-east-1)                  │
+                        │                                                       │
+  GitHub Actions ──────►│  ECR  ──────────────────────────────────────────┐   │
+  (CI/CD)               │  (api, ui, transform images)                    │   │
+                        │                                                  ▼   │
+                        │  ┌────────────────────────────────────────────────┐ │
+                        │  │                EKS Cluster                     │ │
+                        │  │  system node group (m5.large × 2-4)           │ │
+                        │  │  ┌──────────────┐  ┌──────────────────────┐  │ │
+                        │  │  │  API (FastAPI)│  │  UI (React/nginx)    │  │ │
+                        │  │  └──────────────┘  └──────────────────────┘  │ │
+                        │  │                                                │ │
+                        │  │  jobs node group (r5.xlarge SPOT × 0-20)     │ │
+                        │  │  ┌───────────────────────────────────────┐   │ │
+                        │  │  │  transform_job.py  (heavy EKS Jobs)   │   │ │
+                        │  │  └───────────────────────────────────────┘   │ │
+                        │  └────────────────────────────────────────────────┘ │
+                        │                                                       │
+                        │  ┌──────────────────────────────────────────────┐   │
+                        │  │       MWAA (Apache Airflow 2.x)              │   │
+                        │  │  dag_generator.py → custom operators         │   │
+                        │  │  Most tasks run here on Airflow workers       │   │
+                        │  │  eks_job tasks → submit K8s Job → poll       │   │
+                        │  └──────────────────────────────────────────────┘   │
+                        │                      │                               │
+                        │         ┌────────────▼───────────────┐              │
+                        │         │            S3               │              │
+                        │         │  duckdb-store  (pipeline    │              │
+                        │         │  intermediate DuckDB files) │              │
+                        │         │  pipeline-configs           │              │
+                        │         │  artifacts  (SQL backups)   │              │
+                        │         └────────────────────────────┘              │
+                        │                                                       │
+                        │  RDS PostgreSQL  ──  RDS SQL Server (WWI)           │
+                        │  ElastiCache Redis  (Airflow Celery broker)         │
+                        │  Secrets Manager    (all connection credentials)    │
+                        └─────────────────────────────────────────────────────┘
 ```
-
-### Supported Sources
-| Type | Details |
-|------|---------|
-| SQL Server | ODBC / pymssql, full-load and incremental |
-| Oracle | cx_Oracle, full-load and incremental |
-| PostgreSQL | psycopg2, full-load and incremental |
-| MySQL | SQLAlchemy |
-| Kafka | kafka-python consumer, configurable offset/group |
-| GCP Pub/Sub | google-cloud-pubsub subscriber |
-| Files | CSV, TSV, Parquet, JSON/JSONL, Excel from S3 or local |
-| CDC | Change data capture via incremental SQL extracts |
-
-### Supported Targets
-| Type | Details |
-|------|---------|
-| SQL Server | Bulk-insert via SQLAlchemy |
-| Oracle | Bulk-insert via cx_Oracle |
-| PostgreSQL | COPY-style via SQLAlchemy |
-| S3 / Parquet | pyarrow |
-| Kafka | kafka-python producer |
-| GCP Pub/Sub | google-cloud-pubsub publisher |
 
 ---
 
-## Quick Start (Docker Compose)
+## Infrastructure Components
 
-### Prerequisites
-- Docker Desktop ≥ 4.20 (16 GB RAM recommended)
-- Docker Compose v2
-
-### 1. Clone and start
-
-```bash
-git clone https://github.com/your-org/nextgen-databridge-platform.git
-cd nextgen-databridge-platform
-
-# Create .env file
-cat > .env <<EOF
-AIRFLOW_UID=50000
-AWS_ACCESS_KEY_ID=localstack
-AWS_SECRET_ACCESS_KEY=localstack
-AWS_DEFAULT_REGION=us-east-1
-EOF
-
-# Start everything
-docker compose up -d
-
-# Watch logs
-docker compose logs -f dataflow-api airflow-scheduler
-```
-
-### 2. Wait for services (~3 minutes first run)
-
-```bash
-# Check health
-curl http://localhost:8000/health
-curl http://localhost:8080/health  # Airflow
-```
-
-### 3. Access the platform
-
-| Service | URL | Credentials |
-|---------|-----|-------------|
-| **DataFlow UI** | http://localhost:3000 | admin / admin |
-| **DataFlow API** | http://localhost:8000/api/docs | — |
-| **Airflow UI** | http://localhost:8080 | admin / admin |
-| **Grafana** | http://localhost:3001 | admin / admin |
-| **MailHog** | http://localhost:8025 | — |
-| **Prometheus** | http://localhost:9090 | — |
+| Component | Service | Details |
+|-----------|---------|---------|
+| Orchestration | AWS MWAA | Managed Airflow, CeleryExecutor, private VPC |
+| Container platform | Amazon EKS 1.31 | System + SPOT jobs node groups |
+| API / UI | EKS Deployments | FastAPI + React served via ALB |
+| Heavy transforms | EKS Kubernetes Jobs | SPOT r5.xlarge instances, `transform_job.py` |
+| Source DB (WWI) | RDS SQL Server SE 15.0 | WideWorldImporters, publicly accessible |
+| Audit / Airflow DB | RDS PostgreSQL 15 | Publicly accessible |
+| Celery broker | ElastiCache Redis 7.0 | TLS enabled, private subnets |
+| Intermediate storage | S3 | DuckDB files, pipeline configs, artifacts |
+| Image registry | ECR | api, ui, transform repos |
+| Credentials | Secrets Manager | All DB connections under `nextgen-databridge/*` |
 
 ---
 
-## Project Structure
+## Deployment
+
+### GitHub Actions Workflows
+
+All infrastructure and application deployments run through GitHub Actions using AWS OIDC (no long-lived credentials).
+
+#### `infra-provision.yml` — On-demand infrastructure management
+
+Triggered manually via **Actions → Infrastructure Provision → Run workflow**.
 
 ```
-dataflow-platform/
-├── airflow/
-│   ├── dags/
-│   │   └── dag_generator.py          # Dynamic DAG generator (reads all active configs)
-│   └── plugins/
-│       ├── dataflow_operators.py     # All custom Airflow operators
-│       ├── dataflow_callbacks.py     # on_failure/on_success/SLA callbacks
-│       └── config_loader.py         # Config loader (DB + S3 fallback)
-├── backend/
-│   ├── api/
-│   │   └── main.py                  # FastAPI app (all routes, WebSocket, auth)
-│   ├── models/
-│   │   ├── models.py                # SQLAlchemy ORM models
-│   │   └── database.py              # Async engine and session management
-│   ├── services/
-│   │   ├── audit_service.py         # Centralized audit logger
-│   │   └── config_validator.py      # Pipeline JSON config validator
-│   ├── migrations/                  # Alembic DB migrations
-│   ├── Dockerfile
-│   └── requirements.txt
-├── frontend/
-│   ├── src/
-│   │   ├── api/client.ts            # Typed API client
-│   │   ├── store/useStore.ts        # Zustand global state
-│   │   ├── hooks/useWebSocket.ts    # Live event WebSocket hook
-│   │   ├── components/
-│   │   │   ├── Sidebar.tsx          # Navigation sidebar
-│   │   │   └── ui.tsx               # Shared UI components
-│   │   └── pages/
-│   │       ├── Dashboard.tsx        # Main dashboard with metrics + charts
-│   │       ├── Pipelines.tsx        # Pipeline registry + create
-│   │       ├── PipelineDetail.tsx   # DAG view + config editor + run history
-│   │       ├── Runs.tsx             # Run list + run detail + task rerun
-│   │       ├── TasksAlertsAuditConnections.tsx
-│   │       └── DeploymentsQueryEKS.tsx
-│   ├── Dockerfile
-│   └── nginx.conf
-├── eks/
-│   ├── jobs/
-│   │   ├── transform_job.py         # EKS Job entrypoint for heavy transforms
-│   │   └── Dockerfile
-│   └── manifests/
-│       └── platform.yaml            # K8s manifests (Namespace, SA, RBAC, Deployments)
-├── infra/
-│   ├── terraform/
-│   │   ├── main.tf                  # EKS, RDS, ElastiCache, S3, ECR, IAM
-│   │   └── variables.tf
-│   ├── prometheus.yml               # Prometheus scrape config
-│   └── grafana/
-│       ├── datasources/
-│       └── dashboards/              # Auto-provisioned DataFlow dashboard
-├── scripts/
-│   ├── init-multiple-dbs.sh         # Creates airflow + dataflow_audit DBs
-│   └── init-localstack.sh           # Creates S3 buckets and SQS queues
-├── tests/
-│   ├── unit/
-│   │   └── test_config_validator.py # 18 unit tests for config validation
-│   └── integration/
-│       └── test_api.py              # FastAPI integration tests
-├── docs/
-│   ├── sample_pipeline_orders_etl.json
-│   └── sample_pipeline_kafka_clickstream.json
-└── docker-compose.yml
+Inputs:
+  environment:  dev | staging | production | dr
+  module:       all | core | mwaa | wwi
+  action:       plan | apply | destroy
 ```
+
+Job sequence when `module = all`:
+
+```
+setup
+  │
+  ├─► bootstrap        (S3 state bucket + DynamoDB lock table)
+  │
+  ├─► plan-core        (terraform plan infra/terraform/core)
+  │
+  └─► apply-core       (requires GitHub Environment approval for staging/prod)
+        │
+        ├─► plan-mwaa  (runs AFTER apply-core — data sources need live VPC/EKS)
+        ├─► plan-wwi
+        │
+        ├─► apply-mwaa (requires approval)
+        └─► apply-wwi  (requires approval)
+```
+
+Plan output is posted to the job summary so you can review before approving apply.
+
+#### `deploy-dev.yml` — Application deployment to dev
+
+Triggers:
+- Automatically on PR merge to `main`
+- On-demand via **Actions → Deploy Dev → Run workflow** (with optional reason field)
+
+Builds and pushes Docker images to ECR, then rolls out to EKS.
+
+#### `ci.yml` — Pull request checks
+
+Runs on every PR: Python tests, linting, and `terraform validate` (all three modules).
+
+### Required Setup
+
+**Repository secrets** (Settings → Secrets and variables → Actions):
+- `DB_PASSWORD` — PostgreSQL password
+- `MSSQL_PASSWORD` — SQL Server password
+
+**GitHub Environments** (Settings → Environments):
+- `dev`, `staging`, `production`, `dr`
+- Add Required Reviewers to `staging`/`production`/`dr` to gate apply/destroy
+
+IAM role ARNs are stored as workflow `env:` vars (not secrets) in `infra-provision.yml` — update them when creating roles in new accounts.
+
+---
+
+## Task Execution: Airflow vs EKS
+
+This is the key architectural decision for every pipeline task.
+
+### How the decision is made
+
+The `type` field in each task config determines where it runs:
+
+| `type` value | Runs on | Mechanism |
+|---|---|---|
+| `eks_job` | **EKS SPOT Job** | `EKSJobOperator` submits a `batch/v1 Job`, polls until complete |
+| everything else | **MWAA Airflow worker** | Python operator runs inline on the Celery worker |
+
+### When to use `eks_job`
+
+Use `eks_job` for transforms that are:
+- Memory-intensive (joining multiple large DuckDB files)
+- Long-running (minutes to hours)
+- Bursty (no point keeping dedicated workers warm for them)
+
+The SPOT job pool scales to 20 nodes and scales back to zero when idle, so heavy transforms don't block or slow Airflow workers.
+
+All other task types (`sql_extract`, `data_quality`, `load_target`, etc.) run directly on the MWAA worker — they are fast, low-memory operations that don't justify the K8s Job overhead.
+
+### EKSJobOperator flow
+
+```
+Airflow worker
+    │
+    │  1. Submits batch/v1 Job to EKS
+    │     - Image: ECR/nextgen-databridge/transform:<sha>
+    │     - Node selector: role=nextgen-databridge-job (SPOT pool)
+    │     - Env: PIPELINE_ID, RUN_ID, TASK_ID, INPUT_PATHS (JSON),
+    │            OUTPUT_DUCKDB_PATH, TASK_CONFIG (JSON)
+    │
+    │  2. Polls every 15 s until Job completes or fails
+    │
+    │  3. On success: reads OUTPUT_DUCKDB_PATH from XCom
+    │     so downstream tasks can reference the result file
+    │
+    ▼
+EKS SPOT Pod (transform_job.py)
+    │
+    │  1. Downloads input DuckDB files from S3 to /tmp
+    │  2. ATTACHes each as a read-only alias in DuckDB
+    │  3. Runs the SQL from task config
+    │     CREATE OR REPLACE TABLE <output_table> AS (<sql>)
+    │  4. Uploads result DuckDB to S3 (OUTPUT_DUCKDB_PATH)
+    │  5. Writes task_run record to audit DB (success/failed)
+    │  6. Exits 0 (success) or 1 (failure)
+```
+
+### Example: `eks_job` task config
+
+```json
+{
+  "task_id": "heavy_aggregation",
+  "type": "eks_job",
+  "depends_on": ["extract_orders", "extract_products"],
+  "sql": "SELECT o.order_id, p.category, SUM(o.amount) AS total FROM extract_orders.raw AS o JOIN extract_products.raw AS p ON o.product_id = p.id GROUP BY 1, 2",
+  "output": {
+    "duckdb_path": "s3://nextgen-databridge-duckdb-store-dev/pipelines/my_pipeline/runs/{{ run_id }}/aggregated.duckdb",
+    "table": "aggregated"
+  }
+}
+```
+
+The `INPUT_PATHS` env var is automatically populated by the operator from the XCom values of the `depends_on` tasks.
 
 ---
 
 ## Pipeline Configuration
 
-Pipelines are defined as JSON documents. The dynamic DAG generator picks up all active configs from the database (with S3 fallback) and creates Airflow DAGs automatically.
+Pipelines are defined as JSON documents stored in S3 (`nextgen-databridge-pipeline-configs-<env>`). The dynamic DAG generator reads all active configs and creates Airflow DAGs automatically.
 
-### Minimal example
+### Full example
 
 ```json
 {
-  "pipeline_id": "my_pipeline",
+  "pipeline_id": "wwi_orders_etl",
   "version": "1.0.0",
   "schedule": "0 6 * * *",
   "retries": 3,
@@ -220,22 +220,31 @@ Pipelines are defined as JSON documents. The dynamic DAG generator picks up all 
     {
       "task_id": "extract",
       "type": "sql_extract",
-      "source": { "connection": "sqlserver_prod", "query": "SELECT * FROM orders WHERE updated_at >= '{{ ds }}'" },
-      "output": { "duckdb_path": "s3://dataflow-duckdb-store/pipelines/my_pipeline/runs/{{ run_id }}/extract.duckdb", "table": "raw_orders" }
+      "source": {
+        "connection": "wwi_sqlserver",
+        "query": "SELECT * FROM Sales.Orders WHERE OrderDate >= '{{ ds }}'"
+      },
+      "output": {
+        "duckdb_path": "s3://nextgen-databridge-duckdb-store-dev/pipelines/wwi_orders_etl/runs/{{ run_id }}/extract.duckdb",
+        "table": "raw_orders"
+      }
     },
     {
       "task_id": "transform",
-      "type": "duckdb_transform",
+      "type": "eks_job",
       "depends_on": ["extract"],
-      "sql": "SELECT order_id, SUM(amount) AS total FROM extract.raw_orders GROUP BY order_id",
-      "output": { "duckdb_path": "s3://dataflow-duckdb-store/pipelines/my_pipeline/runs/{{ run_id }}/transform.duckdb", "table": "summary" }
+      "sql": "SELECT CustomerID, COUNT(*) AS order_count, SUM(OrderTotal) AS total FROM extract.raw_orders GROUP BY CustomerID",
+      "output": {
+        "duckdb_path": "s3://nextgen-databridge-duckdb-store-dev/pipelines/wwi_orders_etl/runs/{{ run_id }}/transform.duckdb",
+        "table": "customer_summary"
+      }
     },
     {
       "task_id": "quality_check",
       "type": "data_quality",
       "depends_on": ["transform"],
       "checks": [
-        { "type": "not_null", "column": "order_id", "action": "fail" },
+        { "type": "not_null", "column": "CustomerID", "action": "fail" },
         { "type": "row_count_min", "value": 1, "action": "fail" }
       ]
     },
@@ -243,31 +252,58 @@ Pipelines are defined as JSON documents. The dynamic DAG generator picks up all 
       "task_id": "load",
       "type": "load_target",
       "depends_on": ["quality_check"],
-      "source": { "table": "summary" },
-      "target": { "type": "s3", "bucket": "my-data-lake", "path": "orders/{{ ds }}/summary.parquet" }
+      "source": { "table": "customer_summary" },
+      "target": {
+        "type": "mssql",
+        "connection": "wwi_sqlserver_target",
+        "table": "dbo.CustomerOrderSummary",
+        "write_mode": "replace"
+      }
     }
   ]
 }
 ```
 
+### Running any task on EKS
+
+Add `"engine": "eks"` to any `sql_extract` or transform task to run it on an EKS SPOT Job instead of an Airflow worker. The container automatically detects what to do from `OPERATION_TYPE`:
+
+```json
+{ "task_id": "extract_orders", "type": "sql_extract", "engine": "eks",
+  "execution": { "memory": "16Gi", "cpu": "4" },
+  "source": { "connection": "wwi_sqlserver", "query": "SELECT * FROM Sales.Orders" },
+  "output": { "duckdb_path": "s3://...extract.parquet" }
+}
+```
+
+```json
+{ "task_id": "transform_summary", "type": "duckdb_transform", "engine": "eks",
+  "execution": { "memory": "32Gi", "cpu": "8" },
+  "sql": "SELECT CustomerID, SUM(total) FROM extract.raw GROUP BY 1",
+  "output": { "duckdb_path": "s3://...transform.duckdb", "table": "summary" }
+}
+```
+
+Use this for tables with millions–billions of rows where running on an Airflow worker would be too slow or exhaust memory. Extract tasks write Parquet to S3 (streamed in 500k-row chunks — no full dataset in memory). Transform tasks write DuckDB to S3.
+
 ### Task types reference
 
-| Type | Description |
-|------|-------------|
-| `sql_extract` | Extract from SQL Server, Oracle, PostgreSQL via SQL query |
-| `duckdb_transform` | SQL transform using DuckDB (can JOIN multiple upstream DuckDB files) |
-| `data_quality` | Run configurable QC checks (not_null, unique, row_count, freshness, regex, custom_sql) |
-| `schema_validate` | Validate column names and types against expected schema |
-| `file_ingest` | Ingest CSV/TSV/Parquet/JSON/Excel from S3 or local path |
-| `kafka_consume` | Consume messages from Kafka topic into DuckDB |
-| `kafka_produce` | Publish DuckDB data to Kafka topic |
-| `pubsub_consume` | Pull messages from GCP Pub/Sub subscription |
-| `pubsub_publish` | Publish to GCP Pub/Sub topic |
-| `eks_job` | Submit heavy transform as a Kubernetes Job on EKS |
-| `load_target` | Load DuckDB data to SQL Server, Oracle, PostgreSQL, S3, Kafka, or Pub/Sub |
-| `conditional_branch` | Branch pipeline based on evaluated expression |
-| `notification` | Send Slack / email notifications |
-| `cdc_extract` | Incremental extract using change tracking |
+| Type | Default runner | Description |
+|------|----------------|-------------|
+| `sql_extract` | Airflow worker | Extract from SQL Server, Oracle, PostgreSQL via SQL query |
+| `duckdb_transform` | Airflow worker | SQL transform using DuckDB (joins multiple upstream DuckDB files) |
+| `eks_job` | **EKS SPOT Job** | Heavy SQL transform in isolated Kubernetes Job container |
+| `data_quality` | Airflow worker | Run configurable QC checks (not_null, unique, row_count, freshness, regex, custom_sql) |
+| `schema_validate` | Airflow worker | Validate column names and types against expected schema |
+| `file_ingest` | Airflow worker | Ingest CSV/TSV/Parquet/JSON/Excel from S3 or local path |
+| `kafka_consume` | Airflow worker | Consume messages from Kafka topic into DuckDB |
+| `kafka_produce` | Airflow worker | Publish DuckDB data to Kafka topic |
+| `pubsub_consume` | Airflow worker | Pull messages from GCP Pub/Sub subscription |
+| `pubsub_publish` | Airflow worker | Publish to GCP Pub/Sub topic |
+| `load_target` | Airflow worker | Load DuckDB data to SQL Server, Oracle, PostgreSQL, S3, Kafka, or Pub/Sub |
+| `conditional_branch` | Airflow worker | Branch pipeline based on evaluated expression |
+| `notification` | Airflow worker | Send Slack / email notifications |
+| `cdc_extract` | Airflow worker | Incremental extract using change tracking |
 
 ### QC check types
 
@@ -286,117 +322,66 @@ Pipelines are defined as JSON documents. The dynamic DAG generator picks up all 
 
 ---
 
+## Connections
+
+All connection credentials are stored in AWS Secrets Manager under `nextgen-databridge/connections/<name>`.
+
+| Secret name | Type | Notes |
+|---|---|---|
+| `nextgen-databridge/connections/wwi_sqlserver` | mssql | WideWorldImporters source DB |
+| `nextgen-databridge/connections/wwi_sqlserver_target` | mssql | Target DB (TargetDB schema) |
+| `nextgen-databridge/connections/audit_db` | postgresql | Airflow + audit database |
+| `nextgen-databridge/connections/redis` | redis | Celery broker (TLS) |
+
+RDS instances are publicly accessible from any IP (dev only):
+- **PostgreSQL**: port 5432
+- **SQL Server**: port 1433
+
+---
+
+## Supported Sources and Targets
+
+### Sources
+| Type | Details |
+|------|---------|
+| SQL Server | ODBC / pymssql, full-load and incremental |
+| Oracle | cx_Oracle, full-load and incremental |
+| PostgreSQL | psycopg2, full-load and incremental |
+| MySQL | SQLAlchemy |
+| Kafka | kafka-python consumer, configurable offset/group |
+| GCP Pub/Sub | google-cloud-pubsub subscriber |
+| Files | CSV, TSV, Parquet, JSON/JSONL, Excel from S3 or local |
+| CDC | Change data capture via incremental SQL extracts |
+
+### Targets
+| Type | Details |
+|------|---------|
+| SQL Server | Bulk-insert via SQLAlchemy |
+| Oracle | Bulk-insert via cx_Oracle |
+| PostgreSQL | COPY-style via SQLAlchemy |
+| S3 / Parquet | pyarrow |
+| Kafka | kafka-python producer |
+| GCP Pub/Sub | google-cloud-pubsub publisher |
+
+---
+
 ## Audit System
 
-Every event in the platform is recorded in the `audit_logs` table:
+Every event is recorded in the `audit_logs` table in PostgreSQL:
 
 - Pipeline created/updated/paused/resumed
 - Run started/completed/failed/cancelled
 - Task started/completed/failed/retried/skipped
-- Config versions updated
-- Connection created/tested
+- Config versions updated, connections created/tested
 - Deployment submitted/approved/rejected
-- Query Explorer queries executed
-- User logins
 
 Every `task_runs` record captures:
 - Input sources (connection, query, path)
 - Output DuckDB S3 path, table name, row count, schema
 - QC results (per-check pass/fail detail)
-- EKS Job name and pod name
+- EKS Job name and pod name (for `eks_job` tasks)
 - Duration, attempts, error traceback
 - Worker hostname
-
----
-
-## Deployment Approval Workflow
-
-1. Submit deployment via UI or API — specify pipeline, version, environment, approver email
-2. Approver receives HTML email with **Approve** and **Reject** links (tokens expire in 24h)
-3. Click Approve → deployment executes:
-   - Config uploaded to S3
-   - Airflow DAG unpaused
-   - Pipeline version updated in registry
-4. All steps logged to `deployments.deployment_log`
-
----
-
-## Running Tests
-
-```bash
-# Unit tests (no external deps required)
-cd dataflow-platform
-pip install -r tests/requirements-test.txt -r backend/requirements.txt
-pytest tests/unit/ -v
-
-# Integration tests (requires running stack)
-docker compose up -d
-pytest tests/integration/ -v
-```
-
----
-
-## Production Deployment
-
-### EKS (Kubernetes)
-
-```bash
-# Apply K8s manifests
-kubectl apply -f eks/manifests/platform.yaml
-
-# Provision infrastructure with Terraform
-cd infra/terraform
-terraform init
-terraform plan -var="environment=production" -var="db_password=your-secure-password"
-terraform apply
-```
-
-### CI/CD (GitHub Actions example)
-
-```yaml
-- name: Build and push images
-  run: |
-    aws ecr get-login-password | docker login --username AWS --password-stdin $ECR_URL
-    docker build -t $ECR_URL/dataflow/api:$SHA ./backend
-    docker push $ECR_URL/dataflow/api:$SHA
-    docker build -t $ECR_URL/dataflow/transform:$SHA ./eks/jobs
-    docker push $ECR_URL/dataflow/transform:$SHA
-
-- name: Deploy to EKS
-  run: |
-    kubectl set image deployment/dataflow-api api=$ECR_URL/dataflow/api:$SHA -n dataflow
-```
-
----
-
-## Environment Variables
-
-### Backend / Airflow
-
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `DATABASE_URL` | PostgreSQL async URL | `postgresql+asyncpg://dataflow:dataflow@postgres:5432/dataflow_audit` |
-| `AIRFLOW_URL` | Airflow webserver URL | `http://airflow-webserver:8080` |
-| `DATAFLOW_AUDIT_DB_URL` | Audit DB (sync for operators) | — |
-| `DATAFLOW_PIPELINE_CONFIGS_BUCKET` | S3 bucket for pipeline configs | `s3://dataflow-pipeline-configs` |
-| `DATAFLOW_DUCKDB_BUCKET` | S3 bucket for DuckDB files | `dataflow-duckdb-store` |
-| `SECRET_KEY` | JWT signing secret | — |
-| `AWS_ENDPOINT_URL` | LocalStack endpoint (dev) | — |
-| `SLACK_WEBHOOK_URL` | Slack incoming webhook | — |
-| `SMTP_HOST` | SMTP server | `mailhog` |
-| `EKS_CLUSTER_NAME` | EKS cluster name | `dataflow-eks` |
-| `GCP_PROJECT_ID` | GCP project for Pub/Sub | — |
-
----
-
-## Adding a New Connection
-
-1. Go to **Connections** in the UI
-2. Click **New Connection**, fill in host/port/credentials
-3. Click **Test** to verify connectivity
-4. Use the `connection_id` in pipeline task configs
-
-Connections are registered in both the DataFlow DB and Airflow's connection store.
 
 ---
 
@@ -404,17 +389,54 @@ Connections are registered in both the DataFlow DB and Airflow's connection stor
 
 | Component | Technology |
 |-----------|-----------|
-| Orchestration | Apache Airflow 2.8.1 (CeleryExecutor) |
-| Transform engine | DuckDB 0.10 |
-| Intermediate storage | S3 (LocalStack for dev) |
+| Orchestration | AWS MWAA (Apache Airflow 2.x, CeleryExecutor) |
+| Container platform | Amazon EKS 1.31 |
+| Heavy transforms | Kubernetes Jobs on SPOT instances (`transform_job.py`) |
+| Transform engine | DuckDB |
+| Intermediate storage | S3 (`nextgen-databridge-duckdb-store-<env>`) |
 | API | FastAPI + SQLAlchemy async |
-| Auth | JWT (RS256 in prod, HS256 in dev) |
-| Database | PostgreSQL 15 |
-| Task queue | Celery + Redis |
 | Frontend | React 18 + Vite + Tailwind CSS + Recharts |
-| EKS Jobs | Kubernetes Jobs (boto3 + kubernetes SDK) |
-| Monitoring | Prometheus + Grafana |
-| Email (dev) | MailHog |
-| Local cloud | LocalStack 3.0 |
-| IaC | Terraform + Helm |
+| Auth | JWT (RS256 in prod, HS256 in dev) |
+| Source database | RDS SQL Server SE 15.0 (WideWorldImporters) |
+| Audit / Airflow DB | RDS PostgreSQL 15 |
+| Task queue | Celery + ElastiCache Redis 7.0 |
+| Image registry | Amazon ECR |
+| Credentials | AWS Secrets Manager |
+| IaC | Terraform (3 modules: core, mwaa, wwi) |
+| CI/CD | GitHub Actions + AWS OIDC (no long-lived keys) |
 | Tests | pytest + pytest-asyncio |
+
+---
+
+## Project Structure
+
+```
+nextgen-databridge/
+├── .github/workflows/
+│   ├── ci.yml                  # PR checks: tests, lint, terraform validate
+│   ├── infra-provision.yml     # On-demand: plan/apply/destroy any env+module
+│   └── deploy-dev.yml          # On PR merge or manual: build+push+deploy to dev
+├── airflow/
+│   ├── dags/
+│   │   └── dag_generator.py    # Dynamic DAG generator (reads all active configs)
+│   └── plugins/                # Custom operators deployed to MWAA
+├── backend/
+│   ├── api/main.py             # FastAPI app (all routes, WebSocket, auth)
+│   ├── models/                 # SQLAlchemy ORM models
+│   ├── services/               # Audit logger, config validator
+│   └── migrations/             # Alembic DB migrations
+├── frontend/src/               # React 18 admin UI
+├── eks/
+│   └── jobs/
+│       ├── transform_job.py    # EKS Job entrypoint for heavy transforms
+│       └── Dockerfile
+├── infra/terraform/
+│   ├── core/                   # VPC, EKS, S3, RDS PostgreSQL, Redis, ECR, IAM
+│   ├── mwaa/                   # MWAA environment, S3 bucket, IAM
+│   └── wwi/                    # RDS SQL Server, option group, IAM, secrets
+├── scripts/
+│   └── create_github_role.py   # One-time: creates IAM OIDC role for GitHub Actions
+└── tests/
+    ├── unit/                   # Config validator unit tests
+    └── integration/            # FastAPI integration tests
+```

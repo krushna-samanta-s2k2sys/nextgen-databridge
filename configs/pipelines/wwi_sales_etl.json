@@ -36,6 +36,8 @@
     {
       "task_id": "extract_order_lines",
       "type": "sql_extract",
+      "engine": "eks",
+      "execution": { "memory": "8Gi", "cpu": "2" },
       "source": {
         "connection": "wwi_sqlserver",
         "query": "SELECT ol.OrderLineID, ol.OrderID, ol.StockItemID, ol.Description, ol.Quantity, ol.UnitPrice, ol.TaxRate, ol.PickedQuantity, ol.PickingCompletedWhen FROM Sales.OrderLines ol INNER JOIN Sales.Orders o ON ol.OrderID = o.OrderID WHERE o.OrderDate >= DATEADD(day, -1, CAST('{{ ds }}' AS DATE)) AND o.OrderDate < CAST('{{ ds }}' AS DATE)",
@@ -119,6 +121,8 @@
     {
       "task_id": "transform_order_lines_detail",
       "type": "duckdb_transform",
+      "engine": "eks",
+      "execution": { "memory": "16Gi", "cpu": "4" },
       "depends_on": ["validate_order_lines"],
       "sql": "SELECT ol.OrderLineID, ol.OrderID, ol.StockItemID, ol.Description AS StockItemDescription, ol.Quantity, ol.UnitPrice, ol.TaxRate, ROUND(ol.Quantity * ol.UnitPrice, 2) AS LineTotal, ROUND(ol.Quantity * ol.UnitPrice * ol.TaxRate / 100.0, 2) AS TaxAmount, ROUND(ol.Quantity * ol.UnitPrice * (1 + ol.TaxRate / 100.0), 2) AS LineTotalIncTax, ol.PickedQuantity, ol.Quantity - ol.PickedQuantity AS OutstandingQty, CASE WHEN ol.PickedQuantity >= ol.Quantity THEN 'FULLY_PICKED' WHEN ol.PickedQuantity > 0 THEN 'PARTIALLY_PICKED' ELSE 'NOT_PICKED' END AS PickingStatus, ol.PickingCompletedWhen, CURRENT_TIMESTAMP AS etl_loaded_at FROM extract_order_lines.raw_order_lines ol",
       "output": {
@@ -129,6 +133,8 @@
     {
       "task_id": "transform_customer_monthly_sales",
       "type": "duckdb_transform",
+      "engine": "eks",
+      "execution": { "memory": "32Gi", "cpu": "8" },
       "depends_on": ["validate_orders", "validate_order_lines", "extract_customers"],
       "sql": "SELECT c.CustomerID, c.CustomerName, c.IsOnCreditHold, c.CreditLimit, DATE_TRUNC('month', CAST(o.OrderDate AS TIMESTAMP)) AS OrderMonth, COUNT(DISTINCT o.OrderID) AS OrderCount, COUNT(ol.OrderLineID) AS TotalOrderLines, SUM(ol.Quantity) AS TotalUnits, ROUND(SUM(ol.Quantity * ol.UnitPrice), 2) AS TotalRevenue, ROUND(SUM(ol.Quantity * ol.UnitPrice * ol.TaxRate / 100.0), 2) AS TotalTax, ROUND(SUM(ol.Quantity * ol.UnitPrice * (1 + ol.TaxRate / 100.0)), 2) AS TotalRevIncTax, ROUND(AVG(ol.Quantity * ol.UnitPrice), 2) AS AvgLineValue, COUNT(DISTINCT ol.StockItemID) AS UniqueItemsBought, CURRENT_TIMESTAMP AS etl_loaded_at FROM extract_customers.raw_customers c INNER JOIN extract_orders.raw_orders o ON c.CustomerID = o.CustomerID INNER JOIN extract_order_lines.raw_order_lines ol ON o.OrderID = ol.OrderID GROUP BY c.CustomerID, c.CustomerName, c.IsOnCreditHold, c.CreditLimit, DATE_TRUNC('month', CAST(o.OrderDate AS TIMESTAMP))",
       "output": {
