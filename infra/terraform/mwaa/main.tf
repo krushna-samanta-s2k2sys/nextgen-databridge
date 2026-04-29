@@ -224,7 +224,7 @@ resource "aws_s3_object" "mwaa_startup" {
       --secret-id "nextgen-databridge/connections/audit_db" \
       --query SecretString --output text 2>/dev/null || echo '{}')
     export _SM
-    export NEXTGEN_DATABRIDGE_AUDIT_DB_URL=$$(python3 -c \
+    export NEXTGEN_DATABRIDGE_AUDIT_DB_URL=$(python3 -c \
       "import json,os; d=json.loads(os.environ['_SM']); print(d.get('url',''))")
     unset _SM
     export NEXTGEN_DATABRIDGE_DUCKDB_BUCKET="${local.duckdb_store_bucket}"

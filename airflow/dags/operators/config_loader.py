@@ -208,7 +208,10 @@ def load_pipeline_config(pipeline_id: str, version: Optional[str] = None) -> Opt
 
 def _load_from_db() -> List[Dict]:
     import psycopg2
-    url = os.environ["NEXTGEN_DATABRIDGE_AUDIT_DB_URL"].replace("postgresql+asyncpg://", "postgresql://")
+    raw_url = os.getenv("NEXTGEN_DATABRIDGE_AUDIT_DB_URL", "")
+    if not raw_url:
+        raise RuntimeError("NEXTGEN_DATABRIDGE_AUDIT_DB_URL is not set")
+    url = raw_url.replace("postgresql+asyncpg://", "postgresql://")
 
     conn = psycopg2.connect(url)
     cur  = conn.cursor()
@@ -230,7 +233,9 @@ def _load_from_db() -> List[Dict]:
 
 def _load_from_s3() -> List[Dict]:
     import boto3
-    bucket = os.environ["NEXTGEN_DATABRIDGE_PIPELINE_CONFIGS_BUCKET"]
+    bucket = os.getenv("NEXTGEN_DATABRIDGE_PIPELINE_CONFIGS_BUCKET", "")
+    if not bucket:
+        raise RuntimeError("NEXTGEN_DATABRIDGE_PIPELINE_CONFIGS_BUCKET is not set")
     kwargs = dict(region_name=os.getenv("AWS_DEFAULT_REGION", "us-east-1"))
     endpoint = os.getenv("AWS_ENDPOINT_URL")
     if endpoint:
@@ -253,7 +258,10 @@ def _load_from_s3() -> List[Dict]:
 def _load_single_from_db(pipeline_id: str, version: Optional[str]) -> Optional[Dict]:
     try:
         import psycopg2
-        url = os.environ["NEXTGEN_DATABRIDGE_AUDIT_DB_URL"].replace("postgresql+asyncpg://", "postgresql://")
+        raw_url = os.getenv("NEXTGEN_DATABRIDGE_AUDIT_DB_URL", "")
+        if not raw_url:
+            raise RuntimeError("NEXTGEN_DATABRIDGE_AUDIT_DB_URL is not set")
+        url = raw_url.replace("postgresql+asyncpg://", "postgresql://")
         conn = psycopg2.connect(url)
         cur  = conn.cursor()
         if version:
@@ -278,7 +286,9 @@ def _load_single_from_db(pipeline_id: str, version: Optional[str]) -> Optional[D
 def _load_single_from_s3(pipeline_id: str) -> Optional[Dict]:
     try:
         import boto3
-        bucket = os.environ["NEXTGEN_DATABRIDGE_PIPELINE_CONFIGS_BUCKET"]
+        bucket = os.getenv("NEXTGEN_DATABRIDGE_PIPELINE_CONFIGS_BUCKET", "")
+        if not bucket:
+            raise RuntimeError("NEXTGEN_DATABRIDGE_PIPELINE_CONFIGS_BUCKET is not set")
         kwargs = dict(region_name=os.getenv("AWS_DEFAULT_REGION", "us-east-1"))
         endpoint = os.getenv("AWS_ENDPOINT_URL")
         if endpoint:
