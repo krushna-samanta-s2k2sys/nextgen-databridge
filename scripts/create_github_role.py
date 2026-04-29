@@ -137,6 +137,7 @@ def build_policies(account_id: str, region: str) -> dict[str, dict]:
                         "ecr:ListRepositories",
                         "ecr:TagResource",
                         "ecr:UntagResource",
+                        "ecr:ListTagsForResource",
                         "ecr:GetRepositoryPolicy",
                         "ecr:SetRepositoryPolicy",
                         "ecr:DeleteRepositoryPolicy",
@@ -214,6 +215,9 @@ def build_policies(account_id: str, region: str) -> dict[str, dict]:
                         "s3:PutBucketAcl",
                         "s3:GetBucketObjectLockConfiguration",
                         "s3:PutBucketObjectLockConfiguration",
+                        "s3:GetBucketWebsite",
+                        "s3:PutBucketWebsite",
+                        "s3:DeleteBucketWebsite",
                     ],
                     "Resource": [
                         f"arn:aws:s3:::{PROJECT}-terraform-state",
@@ -358,6 +362,7 @@ def build_policies(account_id: str, region: str) -> dict[str, dict]:
                         "ec2:DisassociateAddress",
                         "ec2:ReleaseAddress",
                         "ec2:DescribeAddresses",
+                        "ec2:DescribeAddressesAttribute",
                         # VPC
                         "ec2:CreateVpc",
                         "ec2:DeleteVpc",
@@ -596,6 +601,9 @@ def build_policies(account_id: str, region: str) -> dict[str, dict]:
                     ],
                     "Resource": [
                         f"arn:aws:iam::{account_id}:role/{PROJECT}-*",
+                        # EKS managed node group module creates roles with auto-generated names
+                        f"arn:aws:iam::{account_id}:role/*-eks-node-group-*",
+                        f"arn:aws:iam::{account_id}:role/*-eks-cluster-*",
                         # AWS creates service-linked roles automatically; allow Terraform to read them
                         f"arn:aws:iam::{account_id}:role/aws-service-role/*",
                     ],
@@ -621,7 +629,11 @@ def build_policies(account_id: str, region: str) -> dict[str, dict]:
                     "Sid": "IAMPassRole",
                     "Effect": "Allow",
                     "Action": "iam:PassRole",
-                    "Resource": f"arn:aws:iam::{account_id}:role/{PROJECT}-*",
+                    "Resource": [
+                        f"arn:aws:iam::{account_id}:role/{PROJECT}-*",
+                        f"arn:aws:iam::{account_id}:role/*-eks-node-group-*",
+                        f"arn:aws:iam::{account_id}:role/*-eks-cluster-*",
+                    ],
                     "Condition": {
                         "StringEquals": {
                             "iam:PassedToService": [
@@ -772,6 +784,10 @@ def build_policies(account_id: str, region: str) -> dict[str, dict]:
                         "logs:ListTagsForResource",
                     ],
                     "Resource": [
+                        # EKS cluster log group — uses bare project name (no env suffix)
+                        f"arn:aws:logs:{region}:{account_id}:log-group:/aws/eks/{PROJECT}",
+                        f"arn:aws:logs:{region}:{account_id}:log-group:/aws/eks/{PROJECT}:*",
+                        f"arn:aws:logs:{region}:{account_id}:log-group:/aws/eks/{PROJECT}/*",
                         f"arn:aws:logs:{region}:{account_id}:log-group:/aws/eks/{PROJECT}-*",
                         f"arn:aws:logs:{region}:{account_id}:log-group:/aws/eks/{PROJECT}-*:*",
                         f"arn:aws:logs:{region}:{account_id}:log-group:/aws/mwaa/{PROJECT}-*",
@@ -1170,7 +1186,7 @@ def main() -> None:
         print(f"\n  {role_arn}\n")
         secret_name = f"AWS_ROLE_ARN_{args.env.upper()}"
         print("Add this as a GitHub repository secret:")
-        print(f"  Settings → Secrets and variables → Actions → New repository secret")
+        print(f"  Settings > Secrets and variables > Actions > New repository secret")
         print(f"  Name  : {secret_name}")
         print(f"  Value : {role_arn}")
         print()
