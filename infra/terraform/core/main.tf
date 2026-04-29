@@ -150,20 +150,11 @@ resource "aws_security_group" "rds" {
   vpc_id = module.vpc.vpc_id
 
   ingress {
+    description = "PostgreSQL open access"
     from_port   = 5432
     to_port     = 5432
     protocol    = "tcp"
-    cidr_blocks = [var.vpc_cidr]
-  }
-  dynamic "ingress" {
-    for_each = length(var.developer_cidr_blocks) > 0 ? [1] : []
-    content {
-      description = "PostgreSQL from developer machines"
-      from_port   = 5432
-      to_port     = 5432
-      protocol    = "tcp"
-      cidr_blocks = var.developer_cidr_blocks
-    }
+    cidr_blocks = ["0.0.0.0/0"]
   }
   egress {
     from_port   = 0
