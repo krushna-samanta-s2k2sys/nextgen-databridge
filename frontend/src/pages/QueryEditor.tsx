@@ -32,7 +32,7 @@ function sanitizeAlias(s: string): string {
 }
 
 function fileAlias(f: DuckDBFile): string {
-  return sanitizeAlias(f.table_name || f.task_id || 'table')
+  return sanitizeAlias(f.task_id || 'table')
 }
 
 function formatRunId(runId: string): string {
