@@ -226,6 +226,7 @@ jobs:
           path: |
             infra/terraform/mwaa/tfplan-mwaa.bin
             infra/terraform/mwaa/tfplan-mwaa.txt
+            infra/terraform/mwaa/plugins.zip
           retention-days: 1
       - name: Post plan summary
         if: always()
