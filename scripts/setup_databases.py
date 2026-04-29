@@ -42,6 +42,7 @@ def connect(database="master"):
         server=HOST, port=1433,
         user="sqladmin", password=PASSWORD,
         database=database, as_dict=True,
+        autocommit=True,
         login_timeout=30, timeout=300,
     )
 
@@ -65,7 +66,6 @@ def exec_script(path: str, database="master"):
             for batch in batches:
                 if batch:
                     cur.execute(batch)
-        conn.commit()
 
 
 # ── Step 1: TargetDB ──────────────────────────────────────────────────────────
@@ -116,7 +116,6 @@ def restore_wwi():
                 "@s3_arn_to_restore_from = %s",
                 (s3_arn,),
             )
-        conn.commit()
 
     log.info("Restore task submitted. Polling for completion (timeout 30 min) …")
     wait_for_restore()
