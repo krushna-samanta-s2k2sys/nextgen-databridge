@@ -104,7 +104,7 @@ class NextGenDatabridgeBaseOperator(BaseOperator):
             cur.execute("""
                 INSERT INTO pipelines
                     (id, pipeline_id, name, status, created_by, created_at, updated_at)
-                VALUES (%s, %s, %s, 'ACTIVE', 'airflow', NOW(), NOW())
+                VALUES (%s, %s, %s, 'active', 'airflow', NOW(), NOW())
                 ON CONFLICT (pipeline_id) DO NOTHING
             """, (str(uuid.uuid4()), self.pipeline_id,
                   self.pipeline_config.get("name", self.pipeline_id)))
@@ -118,7 +118,7 @@ class NextGenDatabridgeBaseOperator(BaseOperator):
                     (id, run_id, pipeline_id, status, trigger_type,
                      total_tasks, completed_tasks, failed_tasks, total_rows_processed,
                      created_at)
-                VALUES (%s, %s, %s, 'RUNNING', 'airflow', 0, 0, 0, 0, NOW())
+                VALUES (%s, %s, %s, 'running', 'airflow', 0, 0, 0, 0, NOW())
                 ON CONFLICT (run_id) DO NOTHING
             """, (str(uuid.uuid4()), run_id, self.pipeline_id))
             conn.commit()
@@ -156,13 +156,13 @@ class NextGenDatabridgeBaseOperator(BaseOperator):
                 if row:
                     total_t, completed_t, failed_t = row
                     if total_t > 0 and (completed_t + failed_t) >= total_t:
-                        final_status = "FAILED" if failed_t > 0 else "SUCCESS"
+                        final_status = "failed" if failed_t > 0 else "success"
                         cur.execute("""
                             UPDATE pipeline_runs
                             SET status = CAST(%s AS runstatus),
                                 end_time = NOW(),
                                 duration_seconds = EXTRACT(EPOCH FROM (NOW() - start_time))
-                            WHERE run_id = %s AND status = 'RUNNING'
+                            WHERE run_id = %s AND status = 'running'
                         """, (final_status, run_id))
 
             conn.commit()
@@ -207,8 +207,8 @@ class NextGenDatabridgeBaseOperator(BaseOperator):
                 "run_id": run_id,
                 "pipeline_id": self.pipeline_id,
                 "task_id": self.task_config["task_id"],
-                "task_type": self.task_config.get("type", "").upper().replace("-", "_"),
-                "status": status.upper(),
+                "task_type": self.task_config.get("type", "").lower().replace("-", "_"),
+                "status": status.lower(),
                 "attempt_number": fields.get("attempt_number", 1),
                 "max_attempts": self.task_config.get("retries", self.retries if hasattr(self, "retries") else 3) + 1,
                 "input_sources": json.dumps(fields.get("input_sources", [])),
@@ -237,7 +237,7 @@ class NextGenDatabridgeBaseOperator(BaseOperator):
         except Exception as e:
             logger.error(f"Failed to write task_run audit record: {e}")
 
-    def _write_audit_log(self, event_type: str, run_id: str, details: dict, severity: str = "INFO"):
+    def _write_audit_log(self, event_type: str, run_id: str, details: dict, severity: str = "info"):
         try:
             conn = self._audit_db_conn()
             cur = conn.cursor()
@@ -418,7 +418,7 @@ class SQLExtractOperator(NextGenDatabridgeBaseOperator):
                 error_message=err_msg[:2000],
                 error_traceback=err_tb[:5000],
             )
-            self._write_audit_log("TASK_FAILED", run_id, {"error": err_msg[:500]}, severity="ERROR")
+            self._write_audit_log("TASK_FAILED", run_id, {"error": err_msg[:500]}, severity="error")
             raise
 
     def _extract_data(self, conn_type, host, port, login, password, schema, query, batch_size):
@@ -604,7 +604,7 @@ class DuckDBTransformOperator(NextGenDatabridgeBaseOperator):
                 error_message=err_msg[:2000],
                 error_traceback=traceback.format_exc()[:5000],
             )
-            self._write_audit_log("TASK_FAILED", run_id, {"error": err_msg[:500]}, severity="ERROR")
+            self._write_audit_log("TASK_FAILED", run_id, {"error": err_msg[:500]}, severity="error")
             raise
 
     def _render_sql(self, sql: str, context: Context, local_inputs: dict) -> str:
@@ -719,7 +719,7 @@ class DataQualityOperator(NextGenDatabridgeBaseOperator):
             "TASK_COMPLETED" if overall_pass else "TASK_FAILED",
             run_id,
             {"qc_passed": overall_pass, "failures": failures, "warnings": warnings},
-            severity="INFO" if overall_pass else "ERROR",
+            severity="info" if overall_pass else "error",
         )
 
         context["ti"].xcom_push(key="qc_passed", value=overall_pass)
@@ -1158,13 +1158,55 @@ class EKSJobOperator(NextGenDatabridgeBaseOperator):
                 input_paths[dep] = p
 
         try:
-            from kubernetes import client as k8s_client, config as k8s_config
+            import base64
+            import tempfile
+            import boto3
+            from botocore.signers import RequestSigner
+            from kubernetes import client as k8s_client
 
-            # Load in-cluster config (when running on EKS) or local kubeconfig
-            try:
-                k8s_config.load_incluster_config()
-            except Exception:
-                k8s_config.load_kube_config()
+            region = os.getenv("AWS_DEFAULT_REGION", "us-east-1")
+            cluster_name = os.getenv("EKS_CLUSTER_NAME", "nextgen-databridge")
+
+            # Describe cluster to get endpoint and CA
+            eks_boto = boto3.client("eks", region_name=region)
+            cluster_info = eks_boto.describe_cluster(name=cluster_name)["cluster"]
+
+            # Generate a presigned STS GetCallerIdentity URL — this is the EKS bearer token
+            boto_session = boto3.session.Session()
+            sts_client = boto_session.client("sts", region_name=region)
+            service_id = sts_client.meta.service_model.service_id
+            signer = RequestSigner(
+                service_id, region, "sts", "v4",
+                boto_session.get_credentials(), boto_session.events,
+            )
+            presigned = signer.generate_presigned_url(
+                {
+                    "method": "GET",
+                    "url": f"https://sts.{region}.amazonaws.com/?Action=GetCallerIdentity&Version=2011-06-15",
+                    "body": {},
+                    "headers": {"x-k8s-aws-id": cluster_name},
+                    "context": {},
+                },
+                region_name=region,
+                expires_in=60,
+                operation_name="GetCallerIdentity",
+            )
+            k8s_token = "k8s-aws-v1." + base64.urlsafe_b64encode(
+                presigned.encode("utf-8")
+            ).decode("utf-8").rstrip("=")
+
+            # Write the CA cert to a temp file so the k8s client can verify TLS
+            ca_bytes = base64.b64decode(cluster_info["certificateAuthority"]["data"])
+            ca_file = tempfile.NamedTemporaryFile(delete=False, suffix=".crt")
+            ca_file.write(ca_bytes)
+            ca_file.flush()
+            ca_file.close()
+
+            configuration = k8s_client.Configuration()
+            configuration.host = cluster_info["endpoint"]
+            configuration.ssl_ca_cert = ca_file.name
+            configuration.api_key = {"authorization": f"Bearer {k8s_token}"}
+            k8s_client.Configuration.set_default(configuration)
 
             batch_v1 = k8s_client.BatchV1Api()
 

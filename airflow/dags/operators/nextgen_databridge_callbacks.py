@@ -23,7 +23,10 @@ logger = logging.getLogger("nextgen_databridge.callbacks")
 
 
 def _audit_db_conn():
-    url = os.environ["NEXTGEN_DATABRIDGE_AUDIT_DB_URL"].replace("postgresql+asyncpg://", "postgresql://")
+    raw = os.getenv("NEXTGEN_DATABRIDGE_AUDIT_DB_URL", "")
+    if not raw:
+        raise RuntimeError("NEXTGEN_DATABRIDGE_AUDIT_DB_URL is not set")
+    url = raw.replace("postgresql+asyncpg://", "postgresql://")
     return psycopg2.connect(url)
 
 
@@ -171,7 +174,7 @@ def on_failure_callback(context: dict):
     _write_audit_log(
         "TASK_FAILED", dag_id, run_id, task_id,
         {"error": err_msg[:2000], "attempt": ti.try_number if ti else 1},
-        severity="ERROR",
+        severity="error",
     )
 
     _write_alert(
@@ -206,7 +209,7 @@ def on_success_callback(context: dict):
     _write_audit_log(
         "TASK_COMPLETED", dag_id, run_id, task_id,
         {"duration_seconds": duration},
-        severity="INFO",
+        severity="info",
     )
 
 
@@ -222,7 +225,7 @@ def on_retry_callback(context: dict):
     _write_audit_log(
         "TASK_RETRIED", dag_id, run_id, task_id,
         {"attempt": attempt},
-        severity="WARNING",
+        severity="warning",
     )
 
 
