@@ -217,12 +217,29 @@ def execute_extract(task_config: dict, output_path: str, run_id: str):
             total_rows += len(rows)
             logger.info(f"Extracted {total_rows:,} rows...")
 
-        # Query returned 0 rows — create the empty table so downstream ATTACH
-        # can still reference the table name without a catalog error.
+        # Query returned 0 rows — create an empty table preserving the real column
+        # types from cursor.description so downstream numeric comparisons don't fail.
+        # pymssql sets description[i][1] to the Python type (int, float, datetime…)
+        # even when no rows are returned, so we can build a typed Arrow schema from it.
         if not table_created:
-            col_defs = ", ".join(f'"{name}" VARCHAR' for name in col_names)
-            db.execute(f"CREATE TABLE {output_table} ({col_defs})")
-            logger.info(f"Created empty table {output_table} (query returned 0 rows)")
+            import decimal as _decimal
+            import datetime as _datetime
+
+            def _to_arrow_type(type_code):
+                if type_code is int:                          return pa.int64()
+                if type_code in (float, _decimal.Decimal):   return pa.float64()
+                if type_code is _datetime.datetime:           return pa.timestamp('us')
+                if type_code is _datetime.date:               return pa.date32()
+                if type_code is bool:                         return pa.bool_()
+                if type_code is bytes:                        return pa.binary()
+                return pa.string()
+
+            arrays = [pa.array([], type=_to_arrow_type(d[1])) for d in cursor.description]
+            empty_chunk = pa.table(dict(zip(col_names, arrays)))
+            db.register("_chunk", empty_chunk)
+            db.execute(f"CREATE TABLE {output_table} AS SELECT * FROM _chunk")
+            db.unregister("_chunk")
+            logger.info(f"Created empty table {output_table} with typed schema (query returned 0 rows)")
     finally:
         db.close()
         cursor.close()
