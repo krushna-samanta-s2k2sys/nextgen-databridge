@@ -4,12 +4,17 @@ name: Infrastructure Provision
 # Plan always runs and posts output as a job summary so you can review before approving.
 # Apply and destroy gate on GitHub Environment protection rules (approval required).
 #
-# Required GitHub Secrets:
-#   AWS_ROLE_ARN_DEV, AWS_ROLE_ARN_STAGING, AWS_ROLE_ARN_PROD, AWS_ROLE_ARN_DR
-#   DB_PASSWORD, MSSQL_PASSWORD
+# Role ARNs are NOT secrets — they are resource identifiers stored as workflow env vars.
+# Update the ROLE_ARN_* values below when roles are created in new accounts.
 #
-# Required GitHub Environments (with protection rules):
+# Required repository secrets (Settings → Secrets and variables → Actions):
+#   DB_PASSWORD     — PostgreSQL password
+#   MSSQL_PASSWORD  — SQL Server password
+#
+# Required GitHub Environments (Settings → Environments):
 #   dev, staging, production, dr
+#   Add Required Reviewers to staging/production/dr to gate apply/destroy.
+#   No secrets need to be stored in the environments.
 
 on:
   workflow_dispatch:
@@ -40,13 +45,17 @@ env:
   DR_REGION: us-west-2
   STATE_BUCKET: nextgen-databridge-terraform-state
   LOCK_TABLE: nextgen-databridge-terraform-locks
+  # IAM role ARNs — not secrets, just resource identifiers. Update per account.
+  ROLE_ARN_DEV:        arn:aws:iam::877707676590:role/nextgen-databridge-github-actions-dev
+  ROLE_ARN_STAGING:    arn:aws:iam::STAGING_ACCOUNT_ID:role/nextgen-databridge-github-actions-staging
+  ROLE_ARN_PROD:       arn:aws:iam::PROD_ACCOUNT_ID:role/nextgen-databridge-github-actions-production
+  ROLE_ARN_DR:         arn:aws:iam::DR_ACCOUNT_ID:role/nextgen-databridge-github-actions-dr
 
 jobs:
   # ── Resolve per-environment config ──────────────────────────────────────────
   setup:
     name: "Setup (${{ inputs.environment }} / ${{ inputs.module }} / ${{ inputs.action }})"
     runs-on: ubuntu-latest
-    environment: ${{ inputs.environment }}
     outputs:
       aws_region: ${{ steps.cfg.outputs.aws_region }}
       role_arn: ${{ steps.cfg.outputs.role_arn }}
@@ -58,10 +67,10 @@ jobs:
         id: cfg
         run: |
           case "${{ inputs.environment }}" in
-            dev)        ROLE="${{ secrets.AWS_ROLE_ARN_DEV }}" ;;
-            staging)    ROLE="${{ secrets.AWS_ROLE_ARN_STAGING }}" ;;
-            production) ROLE="${{ secrets.AWS_ROLE_ARN_PROD }}" ;;
-            dr)         ROLE="${{ secrets.AWS_ROLE_ARN_DR }}" ;;
+            dev)        ROLE="${{ env.ROLE_ARN_DEV }}" ;;
+            staging)    ROLE="${{ env.ROLE_ARN_STAGING }}" ;;
+            production) ROLE="${{ env.ROLE_ARN_PROD }}" ;;
+            dr)         ROLE="${{ env.ROLE_ARN_DR }}" ;;
           esac
           [[ "${{ inputs.environment }}" == "dr" ]] \
             && REGION="${{ env.DR_REGION }}" \
@@ -76,24 +85,11 @@ jobs:
           echo "run_wwi=$([[ "${{ inputs.module }}"  == "wwi"  || "$ALL" == "true" ]]     \
             && echo true || echo false)"                                                  >> "$GITHUB_OUTPUT"
 
-      - name: Validate role ARN resolved
-        run: |
-          ROLE="${{ steps.cfg.outputs.role_arn }}"
-          if [[ -z "$ROLE" ]]; then
-            echo "::error::role_arn is empty for environment '${{ inputs.environment }}'."
-            echo "::error::Add the matching secret to the '${{ inputs.environment }}' GitHub Environment:"
-            echo "::error::  dev→AWS_ROLE_ARN_DEV  staging→AWS_ROLE_ARN_STAGING  production→AWS_ROLE_ARN_PROD  dr→AWS_ROLE_ARN_DR"
-            echo "::error::Go to: Settings → Environments → ${{ inputs.environment }} → Add secret"
-            exit 1
-          fi
-          echo "role_arn resolved (length ${#ROLE})"
-
   # ── Bootstrap: state bucket + DynamoDB lock table ───────────────────────────
   bootstrap:
     name: Bootstrap Terraform Backend
     runs-on: ubuntu-latest
     needs: setup
-    environment: ${{ inputs.environment }}
     steps:
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -142,7 +138,6 @@ jobs:
     runs-on: ubuntu-latest
     needs: [setup, bootstrap]
     if: needs.setup.outputs.run_core == 'true'
-    environment: ${{ inputs.environment }}
     steps:
       - uses: actions/checkout@v4
       - uses: aws-actions/configure-aws-credentials@v4
@@ -193,7 +188,6 @@ jobs:
     runs-on: ubuntu-latest
     needs: [setup, bootstrap]
     if: needs.setup.outputs.run_mwaa == 'true'
-    environment: ${{ inputs.environment }}
     steps:
       - uses: actions/checkout@v4
       - uses: aws-actions/configure-aws-credentials@v4
@@ -244,7 +238,6 @@ jobs:
     runs-on: ubuntu-latest
     needs: [setup, bootstrap]
     if: needs.setup.outputs.run_wwi == 'true'
-    environment: ${{ inputs.environment }}
     steps:
       - uses: actions/checkout@v4
       - uses: aws-actions/configure-aws-credentials@v4
