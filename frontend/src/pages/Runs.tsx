@@ -148,6 +148,16 @@ export function RunDetail() {
   const { runId } = useParams<{ runId: string }>()
   const nav = useNavigate()
 
+  // Hooks must be at top level — before any conditional returns
+  const [expandedItems, setExpandedItems] = useState<Set<string>>(new Set())
+  function toggleItem(key: string) {
+    setExpandedItems(prev => {
+      const next = new Set(prev)
+      if (next.has(key)) next.delete(key); else next.add(key)
+      return next
+    })
+  }
+
   const { data: run, isLoading, isError, error } = useQuery({
     queryKey: ['run', runId],
     queryFn: () => getRun(runId!),
@@ -167,15 +177,6 @@ export function RunDetail() {
   const failed    = tasks.filter((t: any) => t.status === 'failed')
   const running   = tasks.filter((t: any) => t.status === 'running')
   const succeeded = tasks.filter((t: any) => t.status === 'success')
-
-  const [expandedItems, setExpandedItems] = useState<Set<string>>(new Set())
-  function toggleItem(key: string) {
-    setExpandedItems(prev => {
-      const next = new Set(prev)
-      if (next.has(key)) next.delete(key); else next.add(key)
-      return next
-    })
-  }
 
   function queryLink(t: any): string {
     if (!t.output_duckdb_path) return ''
