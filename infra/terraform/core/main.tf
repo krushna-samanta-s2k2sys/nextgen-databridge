@@ -45,6 +45,10 @@ module "vpc" {
   enable_dns_hostnames = true
   enable_dns_support   = true
 
+  manage_default_network_acl    = false
+  manage_default_route_table    = false
+  manage_default_security_group = false
+
   public_subnet_tags = { "kubernetes.io/role/elb" = 1 }
   private_subnet_tags = {
     "kubernetes.io/role/internal-elb"          = 1
