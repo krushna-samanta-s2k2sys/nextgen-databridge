@@ -7,14 +7,22 @@ from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sess
 
 from models.models import Base
 
-DATABASE_URL = os.getenv(
+def _asyncpg_url(raw: str) -> str:
+    """Ensure the URL uses the asyncpg driver required by SQLAlchemy async engine."""
+    if raw.startswith("postgresql://") or raw.startswith("postgresql+psycopg2://"):
+        return raw.replace("postgresql+psycopg2://", "postgresql://", 1).replace(
+            "postgresql://", "postgresql+asyncpg://", 1
+        )
+    return raw
+
+DATABASE_URL = _asyncpg_url(os.getenv(
     "DATABASE_URL",
     "postgresql+asyncpg://nextgen_databridge:nextgen_databridge@localhost:5432/nextgen_databridge_audit"
-)
-CONFIG_DB_URL = os.getenv(
+))
+CONFIG_DB_URL = _asyncpg_url(os.getenv(
     "CONFIG_DB_URL",
     "postgresql+asyncpg://nextgen_databridge:nextgen_databridge@localhost:5432/nextgen_databridge_config"
-)
+))
 
 # pool_size=5 per replica (2 replicas = 10 total connections against RDS).
 # connect_args timeout=10 prevents a blocked DB from hanging startup for 300s.
