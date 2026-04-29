@@ -651,6 +651,7 @@ export default function QueryEditor() {
   const primaryTable = selectedFiles[0]?.table_name || 'result'
 
   return (
+    <>
     <div className="flex flex-col h-full overflow-hidden bg-gray-50">
       {/* Top bar */}
       <div className="flex items-center justify-between px-5 py-3 border-b border-gray-200 bg-white flex-shrink-0 shadow-sm">
@@ -845,5 +846,6 @@ export default function QueryEditor() {
     </div>
 
     {showDocs && <DocsOverlay onClose={() => setShowDocs(false)} />}
+    </>
   )
 }
