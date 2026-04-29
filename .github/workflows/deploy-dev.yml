@@ -247,6 +247,25 @@ jobs:
             -var="environment=${{ env.ENVIRONMENT }}" \
             -var="aws_region=${{ env.AWS_REGION }}"
 
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install database setup dependencies
+        run: pip install pymssql boto3
+
+      - name: Create TargetDB tables and restore WideWorldImporters
+        env:
+          MSSQL_PASSWORD:   ${{ secrets.MSSQL_PASSWORD }}
+          AWS_DEFAULT_REGION: ${{ env.AWS_REGION }}
+        run: |
+          SQLSERVER_HOST=$(cd infra/terraform/wwi && terraform output -raw sqlserver_endpoint)
+          ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
+          ARTIFACTS_BUCKET="nextgen-databridge-artifacts-${{ env.ENVIRONMENT }}"
+          export SQLSERVER_HOST ARTIFACTS_BUCKET AWS_ACCOUNT_ID="$ACCOUNT"
+          python scripts/setup_databases.py
+
   deploy-mwaa:
     name: Deploy MWAA Airflow
     runs-on: ubuntu-latest
