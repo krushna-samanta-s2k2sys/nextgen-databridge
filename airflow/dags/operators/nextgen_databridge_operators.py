@@ -1144,8 +1144,11 @@ class EKSJobOperator(NextGenDatabridgeBaseOperator):
 
         # Kubernetes names must be RFC 1123 subdomains: [a-z0-9-], max 63 chars,
         # start/end alphanumeric. run_id contains '+' and ':' from ISO timestamps.
+        # Attempt number is included so each Airflow retry creates a distinct Job
+        # (re-using the same name on retry causes a 409 Conflict from the API server).
         import re as _re
-        _raw = f"df-{self.pipeline_id[:20]}-{task_id[:20]}-{run_id[-16:]}".lower()
+        attempt = getattr(ti, "try_number", 1)
+        _raw = f"df-{self.pipeline_id[:18]}-{task_id[:18]}-{run_id[-12:]}-a{attempt}".lower()
         job_name = _re.sub(r"-+", "-", _re.sub(r"[^a-z0-9-]", "-", _raw)).strip("-")[:63].rstrip("-")
         out_s3   = self.duckdb_s3_path(run_id, task_id)
 
@@ -1154,12 +1157,14 @@ class EKSJobOperator(NextGenDatabridgeBaseOperator):
                              input_sources=[],
                              metrics={"cpu_request": self.cpu_request, "memory_request": self.memory_request})
 
-        # Collect XCom inputs from upstream tasks
+        # Collect input DuckDB paths from upstream tasks.
+        # Walk through passthrough tasks (data_quality, schema_validation) to the
+        # actual producing task so aliases match the SQL database references.
         input_paths = {}
         for dep in self.task_config.get("depends_on", []):
-            p = ti.xcom_pull(task_ids=dep, key="duckdb_path")
-            if p:
-                input_paths[dep] = p
+            producer_id = self._find_duckdb_producer_task(ti, dep)
+            if producer_id and producer_id not in input_paths:
+                input_paths[producer_id] = self.duckdb_s3_path(run_id, producer_id)
 
         try:
             import base64

@@ -214,6 +214,13 @@ def execute_extract(task_config: dict, output_path: str, run_id: str):
 
             total_rows += len(rows)
             logger.info(f"Extracted {total_rows:,} rows...")
+
+        # Query returned 0 rows — create the empty table so downstream ATTACH
+        # can still reference the table name without a catalog error.
+        if not table_created:
+            col_defs = ", ".join(f'"{name}" VARCHAR' for name in col_names)
+            db.execute(f"CREATE TABLE {output_table} ({col_defs})")
+            logger.info(f"Created empty table {output_table} (query returned 0 rows)")
     finally:
         db.close()
         cursor.close()
