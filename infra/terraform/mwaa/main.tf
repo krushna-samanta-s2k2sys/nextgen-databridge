@@ -187,6 +187,17 @@ resource "aws_security_group" "mwaa" {
   }
 }
 
+# Allow MWAA workers to call the EKS API server (port 443) so EKSJobOperator
+# can submit Kubernetes Jobs without routing through load_incluster_config.
+resource "aws_vpc_security_group_ingress_rule" "eks_from_mwaa" {
+  security_group_id            = data.aws_eks_cluster.main.vpc_config[0].cluster_security_group_id
+  referenced_security_group_id = aws_security_group.mwaa.id
+  from_port                    = 443
+  to_port                      = 443
+  ip_protocol                  = "tcp"
+  description                  = "MWAA workers to EKS API server"
+}
+
 # ─────────────────────────────────────────────────────────────────────────────
 # MWAA S3 objects — plugins, requirements, startup script
 # DAGs are uploaded by up-mwaa.sh (application code, not Terraform)
