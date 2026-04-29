@@ -40,8 +40,12 @@ def load_environment_config() -> Dict:
         return _env_config_cache
 
     env_name = os.getenv("NEXTGEN_DATABRIDGE_ENV", "dev")
-    bucket   = os.environ["NEXTGEN_DATABRIDGE_PIPELINE_CONFIGS_BUCKET"]
+    bucket   = os.getenv("NEXTGEN_DATABRIDGE_PIPELINE_CONFIGS_BUCKET", "")
     key      = f"environments/{env_name}.json"
+
+    if not bucket:
+        logger.error("NEXTGEN_DATABRIDGE_PIPELINE_CONFIGS_BUCKET env var is not set")
+        return {}
 
     try:
         import boto3

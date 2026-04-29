@@ -204,8 +204,6 @@ jobs:
       - name: Upload environment + pipeline configs
         run: |
           BUCKET="nextgen-databridge-pipeline-configs-${{ env.ENVIRONMENT }}"
-          ACCT=$(aws sts get-caller-identity --query Account --output text)
-          BUCKET="nextgen-databridge-pipeline-configs-${{ env.ENVIRONMENT }}-${ACCT}"
           aws s3 cp configs/environments/${{ env.ENVIRONMENT }}.json \
             s3://${BUCKET}/environments/${{ env.ENVIRONMENT }}.json 2>/dev/null || true
           for f in configs/pipelines/*.json; do
@@ -257,6 +255,8 @@ jobs:
       mwaa_url: ${{ steps.mwaa-url.outputs.url }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2   # need parent commit to diff against
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -264,11 +264,40 @@ jobs:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN_DEV }}
           aws-region: ${{ env.AWS_REGION }}
 
+      # Only run terraform apply when MWAA infrastructure files actually changed.
+      # DAG file changes don't require an environment update — MWAA polls dags/
+      # automatically and picks up changes within 1-3 minutes. Skipping terraform
+      # here avoids the 20-minute environment update that every DAG deploy was
+      # triggering because deploy_to_mwaa.sh was re-uploading plugins.zip and
+      # requirements.txt (Terraform-managed objects), causing S3 version drift.
+      - name: Check if MWAA infrastructure changed
+        id: mwaa-infra
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "Manual dispatch — running terraform apply"
+          else
+            CHANGED=$(git diff --name-only HEAD^ HEAD -- \
+              infra/terraform/mwaa/ \
+              airflow/requirements.txt \
+              airflow/plugins/ \
+              | wc -l)
+            if [[ "$CHANGED" -gt 0 ]]; then
+              echo "changed=true" >> "$GITHUB_OUTPUT"
+              echo "MWAA infra files changed — running terraform apply"
+            else
+              echo "changed=false" >> "$GITHUB_OUTPUT"
+              echo "No MWAA infra changes — skipping terraform apply"
+            fi
+          fi
+
       - uses: hashicorp/setup-terraform@v3
+        if: steps.mwaa-infra.outputs.changed == 'true'
         with:
           terraform_version: ${{ env.TF_VERSION }}
 
       - name: terraform init
+        if: steps.mwaa-infra.outputs.changed == 'true'
         working-directory: infra/terraform/mwaa
         run: |
           terraform init \
@@ -278,6 +307,7 @@ jobs:
             -backend-config="dynamodb_table=${{ env.LOCK_TABLE }}"
 
       - name: terraform apply
+        if: steps.mwaa-infra.outputs.changed == 'true'
         working-directory: infra/terraform/mwaa
         env:
           TF_VAR_db_password: ${{ secrets.DB_PASSWORD }}
@@ -287,16 +317,18 @@ jobs:
             -var="environment=${{ env.ENVIRONMENT }}" \
             -var="aws_region=${{ env.AWS_REGION }}"
 
-      - name: Upload DAGs to MWAA bucket
+      # Bucket name is deterministic (matches Terraform local.mwaa_bucket).
+      # No terraform output needed — avoids requiring terraform init on DAG-only deploys.
+      - name: Sync DAGs to MWAA bucket
         run: |
-          MWAA_BUCKET=$(cd infra/terraform/mwaa && terraform output -raw mwaa_bucket)
+          MWAA_BUCKET="nextgen-databridge-mwaa-${{ env.ENVIRONMENT }}"
           MWAA_BUCKET="$MWAA_BUCKET" bash airflow/deploy_to_mwaa.sh
 
       - name: Get MWAA webserver URL
         id: mwaa-url
         run: |
           URL=$(aws mwaa get-environment \
-            --name "nextgen-databridge-${{ env.ENVIRONMENT }}" \
+            --name "nextgen-databridge" \
             --query "Environment.WebserverUrl" \
             --output text 2>/dev/null || echo "pending")
           echo "url=https://${URL}" >> "$GITHUB_OUTPUT"
@@ -342,8 +374,8 @@ jobs:
           MWAA_URL="${{ needs.deploy-mwaa.outputs.mwaa_url }}"
           echo "airflow_url=${MWAA_URL}" >> "$GITHUB_OUTPUT"
 
-          DUCKDB_BUCKET="nextgen-databridge-duckdb-store-${{ env.ENVIRONMENT }}-${ACCOUNT}"
-          CONFIGS_BUCKET="nextgen-databridge-pipeline-configs-${{ env.ENVIRONMENT }}-${ACCOUNT}"
+          DUCKDB_BUCKET="nextgen-databridge-duckdb-store-${{ env.ENVIRONMENT }}"
+          CONFIGS_BUCKET="nextgen-databridge-pipeline-configs-${{ env.ENVIRONMENT }}"
           echo "duckdb_bucket=${DUCKDB_BUCKET}"    >> "$GITHUB_OUTPUT"
           echo "configs_bucket=${CONFIGS_BUCKET}"  >> "$GITHUB_OUTPUT"
 

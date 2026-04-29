@@ -1,21 +1,19 @@
 #!/usr/bin/env bash
-# Deploy DAGs, plugins, and requirements to the MWAA S3 bucket.
-# Usage: MWAA_BUCKET=nextgen-databridge-mwaa-dev-123456789 ./deploy_to_mwaa.sh
+# Sync DAGs to the MWAA S3 bucket.
+#
+# plugins.zip, requirements.txt, and startup.sh are managed by Terraform.
+# Re-uploading them here would create new S3 object versions, causing Terraform
+# to detect version drift on the next apply and trigger a 20-minute MWAA
+# environment update even when no infrastructure changed.
+#
+# Usage: MWAA_BUCKET=nextgen-databridge-mwaa-dev ./deploy_to_mwaa.sh
 
 set -euo pipefail
 
 BUCKET="${MWAA_BUCKET:?Set MWAA_BUCKET env var}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
-echo "Uploading DAGs..."
+echo "Syncing DAGs to s3://$BUCKET/dags/ ..."
 aws s3 sync "$SCRIPT_DIR/dags/" "s3://$BUCKET/dags/" --delete
 
-echo "Zipping plugins..."
-(cd "$SCRIPT_DIR/plugins" && zip -r /tmp/plugins.zip . -x "*.pyc" -x "*/__pycache__/*")
-aws s3 cp /tmp/plugins.zip "s3://$BUCKET/plugins.zip"
-rm /tmp/plugins.zip
-
-echo "Uploading requirements.txt..."
-aws s3 cp "$SCRIPT_DIR/requirements.txt" "s3://$BUCKET/requirements.txt"
-
-echo "Done. MWAA will pick up changes within ~1 minute."
+echo "Done. MWAA scheduler picks up DAG changes within 1-3 minutes."
