@@ -187,8 +187,10 @@ jobs:
   plan-mwaa:
     name: Plan — mwaa
     runs-on: ubuntu-latest
-    needs: [setup, bootstrap]
-    if: needs.setup.outputs.run_mwaa == 'true'
+    needs: [setup, apply-core]
+    if: |
+      needs.setup.outputs.run_mwaa == 'true' &&
+      (needs.apply-core.result == 'success' || needs.apply-core.result == 'skipped')
     steps:
       - uses: actions/checkout@v4
       - uses: aws-actions/configure-aws-credentials@v4
@@ -238,8 +240,10 @@ jobs:
   plan-wwi:
     name: Plan — wwi
     runs-on: ubuntu-latest
-    needs: [setup, bootstrap]
-    if: needs.setup.outputs.run_wwi == 'true'
+    needs: [setup, apply-core]
+    if: |
+      needs.setup.outputs.run_wwi == 'true' &&
+      (needs.apply-core.result == 'success' || needs.apply-core.result == 'skipped')
     steps:
       - uses: actions/checkout@v4
       - uses: aws-actions/configure-aws-credentials@v4
