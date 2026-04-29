@@ -7,6 +7,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import secrets
 import uuid
 from contextlib import asynccontextmanager
@@ -235,6 +236,7 @@ class QueryRequest(BaseModel):
     run_id: str
     task_id: str
     duckdb_path: str
+    additional_paths: Optional[List[dict]] = None  # [{path: str, alias: str}]
     sql: str
     limit: int = Field(default=1000, le=10000)
 
@@ -407,6 +409,27 @@ async def get_pipeline(
     )
     config = config_result.scalar_one_or_none()
 
+    config_data = config.config if config else None
+
+    # Fall back to S3 active config if DB has no stored config
+    if config_data is None:
+        try:
+            import boto3 as _boto3, json as _json
+            _s3 = _boto3.client(
+                "s3",
+                aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
+                aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
+                region_name=os.getenv("AWS_DEFAULT_REGION", "us-east-1"),
+            )
+            _bucket = os.getenv(
+                "NEXTGEN_DATABRIDGE_PIPELINE_CONFIGS_BUCKET",
+                "nextgen-databridge-pipeline-configs-dev",
+            )
+            _obj = _s3.get_object(Bucket=_bucket, Key=f"active/{pipeline.pipeline_id}.json")
+            config_data = _json.loads(_obj["Body"].read())
+        except Exception:
+            pass
+
     return {
         "pipeline_id": pipeline.pipeline_id,
         "name": pipeline.name,
@@ -414,7 +437,7 @@ async def get_pipeline(
         "status": pipeline.status.value,
         "current_version": pipeline.current_version,
         "schedule": pipeline.schedule,
-        "config": config.config if config else None,
+        "config": config_data,
         "tags": pipeline.tags,
         "owner": pipeline.owner,
         "sla_minutes": pipeline.sla_minutes,
@@ -1171,6 +1194,7 @@ async def query_duckdb(
     # Download DuckDB from S3
     s3_path    = req.duckdb_path
     local_path = f"/tmp/query_{uuid.uuid4().hex[:8]}.duckdb"
+    extra_local: list[str] = []
 
     try:
         s3_client_kwargs = dict(
@@ -1186,9 +1210,6 @@ async def query_duckdb(
         bucket, key = s3_path.replace("s3://", "").split("/", 1)
         s3.download_file(bucket, key, local_path)
 
-        # Execute query with row limit
-        conn = ddb.connect(local_path, read_only=True)
-
         # Allow SELECT, DESCRIBE, SHOW, and SUMMARIZE; reject all mutating statements
         safe_sql  = req.sql.strip().rstrip(";")
         sql_upper = safe_sql.upper().lstrip()
@@ -1196,7 +1217,23 @@ async def query_duckdb(
         if not any(sql_upper.startswith(p) for p in ALLOWED_PREFIXES):
             raise HTTPException(400, "Only SELECT / DESCRIBE / SHOW / SUMMARIZE queries are allowed in Query Explorer")
 
-        # SELECT gets wrapped with a row-limit subquery; others run directly
+        if req.additional_paths:
+            # Multi-file mode: open in-memory DB and ATTACH all files with aliases
+            conn = ddb.connect(':memory:')
+            primary_alias = re.sub(r'[^a-z0-9_]', '_', req.task_id.lower())
+            conn.execute(f"ATTACH '{local_path}' AS {primary_alias} (READ_ONLY)")
+            for item in req.additional_paths:
+                extra_path  = f"/tmp/query_extra_{uuid.uuid4().hex[:8]}.duckdb"
+                extra_local.append(extra_path)
+                e_bucket, e_key = item['path'].replace('s3://', '').split('/', 1)
+                s3.download_file(e_bucket, e_key, extra_path)
+                alias = re.sub(r'[^a-z0-9_]', '_', item['alias'].lower())
+                conn.execute(f"ATTACH '{extra_path}' AS {alias} (READ_ONLY)")
+        else:
+            # Single-file mode
+            conn = ddb.connect(local_path, read_only=True)
+
+        # SELECT / SUMMARIZE get a row-limit wrapper; others (DESCRIBE, SHOW) run directly
         if sql_upper.startswith("SELECT") or sql_upper.startswith("SUMMARIZE"):
             limited_sql = f"SELECT * FROM ({safe_sql}) _q LIMIT {req.limit}"
         else:
@@ -1230,6 +1267,9 @@ async def query_duckdb(
     finally:
         if os.path.exists(local_path):
             os.unlink(local_path)
+        for ep in extra_local:
+            if os.path.exists(ep):
+                os.unlink(ep)
 
 
 @app.get("/api/query/duckdb-files", tags=["Query"])

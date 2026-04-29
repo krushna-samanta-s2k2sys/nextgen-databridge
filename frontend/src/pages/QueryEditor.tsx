@@ -8,8 +8,8 @@ import { Spinner } from '../components/ui'
 import {
   Database, Search, RefreshCw, Play, Download, Copy,
   CheckCircle, ChevronDown, ChevronRight, XCircle,
-  TableProperties, FileText, Hash, Type as TypeIcon,
-  Clock, Rows, BarChart2,
+  Hash, Type as TypeIcon, Clock, Rows, BarChart2,
+  Columns, X, Plus, Link2,
 } from 'lucide-react'
 import clsx from 'clsx'
 
@@ -19,61 +19,59 @@ interface DuckDBFile {
   pipeline_id: string
   run_id: string
   task_id: string
-  table_name?: string
+  table_name?: string | null
   row_count?: number
 }
 
-interface SchemaRow {
-  column_name: string
-  column_type: string
-}
-
-interface QueryResult {
-  columns: string[]
-  rows: any[][]
-  row_count: number
-  duration_ms: number
-}
+interface SchemaRow { column_name: string; column_type: string }
+interface QueryResult { columns: string[]; rows: any[][]; row_count: number; duration_ms: number }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+function sanitizeAlias(s: string): string {
+  return s.replace(/[^a-z0-9_]/gi, '_').toLowerCase()
+}
+
+function fileAlias(f: DuckDBFile): string {
+  return sanitizeAlias(f.table_name || f.task_id || 'table')
+}
+
 function formatRunId(runId: string): string {
-  // e.g. "2024-04-29T07:00:00+00:00__scheduled" → "Apr 29 07:00"
   try {
     const dt = new Date(runId.split('__')[0] || runId.split('_')[0] || runId)
-    if (!isNaN(dt.getTime())) return dt.toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })
+    if (!isNaN(dt.getTime()))
+      return dt.toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })
   } catch {}
   return runId.slice(-20)
 }
 
 function typeIcon(colType: string) {
   const t = colType?.toLowerCase() ?? ''
-  if (t.includes('int') || t.includes('double') || t.includes('float') || t.includes('decimal') || t.includes('numeric')) {
+  if (t.includes('int') || t.includes('double') || t.includes('float') || t.includes('decimal') || t.includes('numeric'))
     return <Hash size={10} className="text-blue-500 flex-shrink-0" />
-  }
-  if (t.includes('timestamp') || t.includes('date') || t.includes('time')) {
+  if (t.includes('timestamp') || t.includes('date') || t.includes('time'))
     return <Clock size={10} className="text-purple-500 flex-shrink-0" />
-  }
   return <TypeIcon size={10} className="text-gray-400 flex-shrink-0" />
 }
 
 const SNIPPETS = [
-  { label: 'All rows',      sql: (t: string) => `SELECT *\nFROM ${t}\nLIMIT 100` },
+  { label: 'All rows',      sql: (t: string, multi: boolean) =>
+      multi ? `SELECT *\nFROM ${t}\nLIMIT 100` : `SELECT *\nFROM ${t}\nLIMIT 100` },
   { label: 'Row count',     sql: (t: string) => `SELECT COUNT(*) AS total_rows\nFROM ${t}` },
-  { label: 'Null check',    sql: (t: string) => `-- Replace column_name with any column\nSELECT COUNT(*) AS nulls\nFROM ${t}\nWHERE column_name IS NULL` },
   { label: 'Column stats',  sql: (t: string) => `SUMMARIZE SELECT * FROM ${t}` },
-  { label: 'Distinct vals', sql: (t: string) => `-- Replace column_name with any column\nSELECT column_name, COUNT(*) AS cnt\nFROM ${t}\nGROUP BY 1\nORDER BY cnt DESC\nLIMIT 50` },
+  { label: 'Null check',    sql: (t: string) => `-- Replace column_name below\nSELECT COUNT(*) AS nulls\nFROM ${t}\nWHERE column_name IS NULL` },
+  { label: 'Distinct vals', sql: (t: string) => `-- Replace column_name below\nSELECT column_name, COUNT(*) AS cnt\nFROM ${t}\nGROUP BY 1\nORDER BY cnt DESC\nLIMIT 50` },
 ]
 
 // ── File browser ──────────────────────────────────────────────────────────────
 function FileBrowser({
-  selectedPath, onSelect, onRefresh,
+  selectedPaths, onToggle, onRefresh,
 }: {
-  selectedPath?: string
-  onSelect: (f: DuckDBFile) => void
+  selectedPaths: string[]
+  onToggle: (f: DuckDBFile) => void
   onRefresh: () => void
 }) {
-  const [search,       setSearch]       = useState('')
-  const [expanded,     setExpanded]     = useState<Record<string, boolean>>({})
+  const [search,   setSearch]   = useState('')
+  const [expanded, setExpanded] = useState<Record<string, boolean>>({})
 
   const { data, isLoading, isError, refetch } = useQuery({
     queryKey: ['duckdb-files'],
@@ -84,7 +82,6 @@ function FileBrowser({
 
   const files: DuckDBFile[] = data?.files ?? []
 
-  // Group by pipeline → run
   const grouped: Record<string, Record<string, DuckDBFile[]>> = {}
   files.forEach(f => {
     const pid = f.pipeline_id || 'unknown'
@@ -94,36 +91,22 @@ function FileBrowser({
     grouped[pid][rid].push(f)
   })
 
-  // Filter by search
   const filteredPipelines = Object.entries(grouped).filter(([pid]) =>
     !search || pid.toLowerCase().includes(search.toLowerCase()),
   )
 
-  function togglePipeline(pid: string) {
-    setExpanded(e => ({ ...e, [pid]: !e[pid] }))
-  }
-  function toggleRun(key: string) {
-    setExpanded(e => ({ ...e, [key]: !e[key] }))
-  }
-
-  // Auto-expand pipeline that has the selected file
   useEffect(() => {
-    if (!selectedPath) return
-    const f = files.find(f => f.s3_path === selectedPath)
-    if (f) {
-      setExpanded(e => ({
-        ...e,
-        [f.pipeline_id]: true,
-        [`${f.pipeline_id}__${f.run_id}`]: true,
-      }))
-    }
-  }, [selectedPath, files.length])
-
-  function handleRefresh() { refetch(); onRefresh() }
+    if (!selectedPaths.length) return
+    const f = files.find(f => f.s3_path === selectedPaths[0])
+    if (f) setExpanded(e => ({
+      ...e,
+      [f.pipeline_id]: true,
+      [`${f.pipeline_id}__${f.run_id}`]: true,
+    }))
+  }, [selectedPaths[0], files.length])
 
   return (
     <div className="flex flex-col h-full w-56 flex-shrink-0 bg-white border-r border-gray-200">
-      {/* Header */}
       <div className="px-3 py-2.5 border-b border-gray-100 flex items-center gap-2">
         <div className="relative flex-1">
           <Search size={11} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-gray-400" />
@@ -134,86 +117,75 @@ function FileBrowser({
             className="w-full bg-gray-50 border border-gray-200 rounded-md pl-7 pr-2 py-1.5 text-xs text-gray-700 focus:outline-none focus:ring-1 focus:ring-blue-500 placeholder:text-gray-400"
           />
         </div>
-        <button
-          onClick={handleRefresh}
-          className="text-gray-400 hover:text-gray-600 p-1 rounded hover:bg-gray-100 flex-shrink-0 transition-colors"
-          title="Refresh file list"
-        >
+        <button onClick={() => { refetch(); onRefresh() }}
+          className="text-gray-400 hover:text-gray-600 p-1 rounded hover:bg-gray-100 flex-shrink-0 transition-colors">
           <RefreshCw size={11} />
         </button>
       </div>
 
-      {/* Tree */}
       <div className="flex-1 overflow-y-auto text-xs">
         {isLoading && <div className="flex justify-center py-8"><Spinner size="sm" /></div>}
         {isError && <p className="text-red-500 px-3 py-4 text-xs">Failed to load files</p>}
-
         {!isLoading && filteredPipelines.length === 0 && (
           <div className="flex flex-col items-center py-10 gap-2">
             <Database size={20} className="text-gray-200" />
             <p className="text-gray-400 text-xs text-center px-2">
-              {search ? 'No pipelines match filter' : 'No DuckDB outputs yet'}
+              {search ? 'No match' : 'No DuckDB outputs yet'}
             </p>
           </div>
         )}
 
         {filteredPipelines.map(([pid, runs]) => {
-          const isPipelineOpen = !!expanded[pid]
+          const isOpen = !!expanded[pid]
           return (
             <div key={pid}>
-              {/* Pipeline row */}
-              <div
-                onClick={() => togglePipeline(pid)}
-                className="flex items-center gap-1.5 px-3 py-2 cursor-pointer hover:bg-gray-50 select-none border-b border-gray-50"
-              >
-                {isPipelineOpen
-                  ? <ChevronDown size={11} className="text-gray-400 flex-shrink-0" />
-                  : <ChevronRight size={11} className="text-gray-400 flex-shrink-0" />}
+              <div onClick={() => setExpanded(e => ({ ...e, [pid]: !e[pid] }))}
+                className="flex items-center gap-1.5 px-3 py-2 cursor-pointer hover:bg-gray-50 select-none border-b border-gray-50">
+                {isOpen ? <ChevronDown size={11} className="text-gray-400 flex-shrink-0" />
+                        : <ChevronRight size={11} className="text-gray-400 flex-shrink-0" />}
                 <Database size={11} className="text-blue-500 flex-shrink-0" />
                 <span className="font-mono font-semibold text-gray-700 truncate">{pid}</span>
               </div>
 
-              {isPipelineOpen && Object.entries(runs).map(([rid, taskFiles]) => {
-                const runKey   = `${pid}__${rid}`
+              {isOpen && Object.entries(runs).map(([rid, taskFiles]) => {
+                const runKey = `${pid}__${rid}`
                 const isRunOpen = !!expanded[runKey]
                 return (
                   <div key={rid}>
-                    {/* Run row */}
-                    <div
-                      onClick={() => toggleRun(runKey)}
-                      className="flex items-center gap-1.5 pl-6 pr-3 py-1.5 cursor-pointer hover:bg-gray-50 select-none border-b border-gray-50"
-                    >
-                      {isRunOpen
-                        ? <ChevronDown size={10} className="text-gray-300 flex-shrink-0" />
-                        : <ChevronRight size={10} className="text-gray-300 flex-shrink-0" />}
+                    <div onClick={() => setExpanded(e => ({ ...e, [runKey]: !e[runKey] }))}
+                      className="flex items-center gap-1.5 pl-6 pr-3 py-1.5 cursor-pointer hover:bg-gray-50 select-none border-b border-gray-50">
+                      {isRunOpen ? <ChevronDown size={10} className="text-gray-300 flex-shrink-0" />
+                                 : <ChevronRight size={10} className="text-gray-300 flex-shrink-0" />}
                       <Clock size={10} className="text-gray-400 flex-shrink-0" />
                       <span className="text-gray-500 truncate font-mono" title={rid}>{formatRunId(rid)}</span>
                     </div>
 
-                    {/* File rows */}
                     {isRunOpen && taskFiles.map(f => {
-                      const fname      = f.s3_path.split('/').slice(-1)[0]
-                      const isSelected = f.s3_path === selectedPath
+                      const selIdx    = selectedPaths.indexOf(f.s3_path)
+                      const isSelected = selIdx >= 0
                       return (
-                        <div
-                          key={f.s3_path}
-                          onClick={() => onSelect(f)}
+                        <div key={f.s3_path} onClick={() => onToggle(f)}
                           className={clsx(
                             'flex items-start gap-1.5 pl-10 pr-3 py-2 cursor-pointer border-b border-gray-50 transition-colors',
+                            isSelected ? 'bg-blue-50 border-l-2 border-l-blue-500' : 'hover:bg-gray-50',
+                          )}>
+                          {/* Selection indicator */}
+                          <div className={clsx(
+                            'flex-shrink-0 w-4 h-4 rounded-full border flex items-center justify-center mt-0.5 text-xs font-bold',
                             isSelected
-                              ? 'bg-blue-50 border-l-2 border-l-blue-500'
-                              : 'hover:bg-gray-50',
-                          )}
-                        >
-                          <FileText size={10} className={clsx('flex-shrink-0 mt-0.5', isSelected ? 'text-blue-500' : 'text-gray-300')} />
+                              ? 'bg-blue-500 border-blue-500 text-white'
+                              : 'border-gray-300 text-gray-300',
+                          )}>
+                            {isSelected ? selIdx + 1 : <Plus size={8} />}
+                          </div>
                           <div className="min-w-0 flex-1">
-                            <p className={clsx('font-mono truncate leading-tight', isSelected ? 'text-blue-700 font-medium' : 'text-gray-700')}>
+                            <p className={clsx('font-mono truncate leading-tight text-xs',
+                              isSelected ? 'text-blue-700 font-medium' : 'text-gray-700')}>
                               {f.task_id}
                             </p>
                             {f.row_count != null && (
-                              <p className="text-gray-400 mt-0.5 flex items-center gap-1">
-                                <Rows size={9} />
-                                {f.row_count.toLocaleString()} rows
+                              <p className="text-gray-400 mt-0.5 flex items-center gap-1 text-xs">
+                                <Rows size={9} />{f.row_count.toLocaleString()} rows
                               </p>
                             )}
                           </div>
@@ -235,35 +207,64 @@ function FileBrowser({
   )
 }
 
-// ── Schema panel ──────────────────────────────────────────────────────────────
-function SchemaPanel({ schema, loading }: { schema: SchemaRow[]; loading: boolean }) {
-  if (loading) return (
-    <div className="flex items-center gap-2 px-4 py-3 bg-gray-50 border-b border-gray-200">
-      <Spinner size="sm" />
-      <span className="text-xs text-gray-500">Loading schema…</span>
+// ── Schema panel (right, collapsible) ─────────────────────────────────────────
+function SchemaPanel({
+  files, schemas, loadingFor,
+}: {
+  files: DuckDBFile[]
+  schemas: Record<string, SchemaRow[]>
+  loadingFor: Set<string>
+}) {
+  const [collapsed, setCollapsed] = useState<Record<string, boolean>>({})
+
+  if (files.length === 0) return (
+    <div className="flex flex-col items-center justify-center h-full gap-2 text-gray-300 px-4">
+      <Columns size={24} strokeWidth={1.5} />
+      <p className="text-xs text-center text-gray-400">Select a file to see its schema</p>
     </div>
   )
-  if (schema.length === 0) return null
 
   return (
-    <div className="bg-gray-50 border-b border-gray-200 px-4 py-2 flex items-start gap-3 overflow-x-auto flex-shrink-0">
-      <div className="flex items-center gap-1 text-xs text-gray-500 flex-shrink-0 pt-0.5">
-        <TableProperties size={11} />
-        <span className="font-semibold">Schema</span>
-        <span className="text-gray-400">({schema.length} cols)</span>
-      </div>
-      <div className="flex items-start gap-2 flex-wrap">
-        {schema.map(col => (
-          <div
-            key={col.column_name}
-            className="flex items-center gap-1 bg-white border border-gray-200 rounded px-2 py-1 text-xs whitespace-nowrap shadow-sm"
-          >
-            {typeIcon(col.column_type)}
-            <span className="font-mono text-gray-700 font-medium">{col.column_name}</span>
-            <span className="text-gray-400">{col.column_type}</span>
+    <div className="h-full overflow-y-auto text-xs">
+      {files.map((f, idx) => {
+        const alias    = fileAlias(f)
+        const cols     = schemas[f.s3_path] ?? []
+        const loading  = loadingFor.has(f.s3_path)
+        const isOpen   = !collapsed[f.s3_path]
+        return (
+          <div key={f.s3_path} className="border-b border-gray-100">
+            <div
+              onClick={() => setCollapsed(c => ({ ...c, [f.s3_path]: !c[f.s3_path] }))}
+              className="flex items-center gap-2 px-3 py-2 cursor-pointer hover:bg-gray-50 select-none sticky top-0 bg-white z-10"
+            >
+              <div className="w-4 h-4 rounded-full bg-blue-500 flex items-center justify-center text-white font-bold text-xs flex-shrink-0">
+                {idx + 1}
+              </div>
+              {isOpen
+                ? <ChevronDown size={11} className="text-gray-400 flex-shrink-0" />
+                : <ChevronRight size={11} className="text-gray-400 flex-shrink-0" />}
+              <span className="font-mono font-semibold text-gray-700 truncate flex-1">{alias}</span>
+              {loading && <Spinner size="sm" />}
+              {!loading && <span className="text-gray-400 flex-shrink-0">{cols.length} cols</span>}
+            </div>
+            {isOpen && (
+              <div className="pb-2">
+                {cols.length === 0 && !loading && (
+                  <p className="px-4 py-2 text-gray-400 italic">No schema loaded</p>
+                )}
+                {cols.map(col => (
+                  <div key={col.column_name}
+                    className="flex items-center gap-1.5 px-4 py-1 hover:bg-gray-50">
+                    {typeIcon(col.column_type)}
+                    <span className="font-mono text-gray-700 truncate flex-1">{col.column_name}</span>
+                    <span className="text-gray-400 flex-shrink-0 text-xs">{col.column_type.split('(')[0]}</span>
+                  </div>
+                ))}
+              </div>
+            )}
           </div>
-        ))}
-      </div>
+        )
+      })}
     </div>
   )
 }
@@ -273,30 +274,25 @@ function ResultsTable({ result }: { result: QueryResult }) {
   const [copied, setCopied] = useState(false)
 
   function copyTSV() {
-    const header = result.columns.join('\t')
-    const rows   = result.rows.map(r => r.map(c => c ?? '').join('\t')).join('\n')
-    navigator.clipboard.writeText(`${header}\n${rows}`)
+    const rows = result.rows.map(r => r.map(c => c ?? '').join('\t')).join('\n')
+    navigator.clipboard.writeText(`${result.columns.join('\t')}\n${rows}`)
     setCopied(true)
     setTimeout(() => setCopied(false), 2000)
   }
 
   function downloadCSV() {
-    const header = result.columns.join(',')
-    const rows   = result.rows.map(r =>
-      r.map(c => c === null ? '' : String(c).includes(',') ? `"${c}"` : c).join(',')
+    const rows = result.rows.map(r =>
+      r.map(c => c === null ? '' : String(c).includes(',') ? `"${c}"` : c).join(','),
     ).join('\n')
-    const blob = new Blob([`${header}\n${rows}`], { type: 'text/csv' })
+    const blob = new Blob([`${result.columns.join(',')}\n${rows}`], { type: 'text/csv' })
     const url  = URL.createObjectURL(blob)
     const a    = document.createElement('a')
-    a.href = url
-    a.download = `query_${Date.now()}.csv`
-    a.click()
+    a.href = url; a.download = `query_${Date.now()}.csv`; a.click()
     URL.revokeObjectURL(url)
   }
 
   return (
     <div className="flex-1 flex flex-col overflow-hidden">
-      {/* Result meta bar */}
       <div className="flex items-center justify-between px-4 py-2 border-b border-gray-200 bg-white flex-shrink-0">
         <div className="flex items-center gap-4">
           <div className="flex items-center gap-1.5 text-xs">
@@ -314,23 +310,17 @@ function ResultsTable({ result }: { result: QueryResult }) {
           </div>
         </div>
         <div className="flex items-center gap-1.5">
-          <button
-            onClick={copyTSV}
-            className="flex items-center gap-1 text-xs text-gray-600 hover:text-gray-800 bg-white hover:bg-gray-50 border border-gray-300 px-2.5 py-1.5 rounded-lg transition-colors shadow-sm"
-          >
+          <button onClick={copyTSV}
+            className="flex items-center gap-1 text-xs text-gray-600 hover:text-gray-800 bg-white hover:bg-gray-50 border border-gray-300 px-2.5 py-1.5 rounded-lg transition-colors shadow-sm">
             {copied ? <CheckCircle size={11} className="text-emerald-500" /> : <Copy size={11} />}
             {copied ? 'Copied!' : 'Copy TSV'}
           </button>
-          <button
-            onClick={downloadCSV}
-            className="flex items-center gap-1 text-xs text-white bg-blue-600 hover:bg-blue-500 px-2.5 py-1.5 rounded-lg transition-colors shadow-sm"
-          >
+          <button onClick={downloadCSV}
+            className="flex items-center gap-1 text-xs text-white bg-blue-600 hover:bg-blue-500 px-2.5 py-1.5 rounded-lg transition-colors shadow-sm">
             <Download size={11} /> Export CSV
           </button>
         </div>
       </div>
-
-      {/* Table */}
       <div className="flex-1 overflow-auto">
         {result.row_count === 0 ? (
           <div className="flex flex-col items-center justify-center h-full gap-2 text-gray-300">
@@ -343,9 +333,7 @@ function ResultsTable({ result }: { result: QueryResult }) {
               <tr>
                 <th className="px-3 py-2 text-center text-gray-300 font-medium border-b border-r border-gray-200 w-10 bg-gray-50">#</th>
                 {result.columns.map(c => (
-                  <th key={c} className="px-3 py-2 text-left text-gray-600 font-semibold border-b border-r border-gray-200 whitespace-nowrap bg-gray-50 font-mono">
-                    {c}
-                  </th>
+                  <th key={c} className="px-3 py-2 text-left text-gray-600 font-semibold border-b border-r border-gray-200 whitespace-nowrap bg-gray-50 font-mono">{c}</th>
                 ))}
               </tr>
             </thead>
@@ -354,13 +342,10 @@ function ResultsTable({ result }: { result: QueryResult }) {
                 <tr key={i} className={clsx('border-b border-gray-100', i % 2 === 0 ? 'bg-white' : 'bg-gray-50/30')}>
                   <td className="px-3 py-2 text-gray-300 font-mono text-right border-r border-gray-100 select-none">{i + 1}</td>
                   {row.map((cell, j) => (
-                    <td
-                      key={j}
-                      className="px-3 py-2 font-mono whitespace-nowrap max-w-xs truncate border-r border-gray-100"
-                      title={cell === null ? 'NULL' : String(cell)}
-                    >
+                    <td key={j} className="px-3 py-2 font-mono whitespace-nowrap max-w-xs truncate border-r border-gray-100"
+                      title={cell === null ? 'NULL' : String(cell)}>
                       {cell === null
-                        ? <span className="text-gray-300 italic not-italic text-xs">NULL</span>
+                        ? <span className="text-gray-300 italic text-xs">NULL</span>
                         : typeof cell === 'number'
                           ? <span className="text-blue-700">{cell}</span>
                           : typeof cell === 'boolean'
@@ -383,126 +368,171 @@ function ResultsTable({ result }: { result: QueryResult }) {
 export default function QueryEditor() {
   const location = useLocation()
 
-  const [selectedFile, setSelectedFile] = useState<DuckDBFile | null>(null)
-  const [sql,          setSql]          = useState('-- Select a file on the left, then write SQL\n-- Ctrl+Enter to run\n\nSELECT *\nFROM result\nLIMIT 100')
-  const [result,       setResult]       = useState<QueryResult | null>(null)
-  const [schema,       setSchema]       = useState<SchemaRow[]>([])
-  const [schemaLoading, setSchemaLoading] = useState(false)
-  const [rowLimit,     setRowLimit]     = useState('500')
-  const [filesKey,     setFilesKey]     = useState(0)
+  const [selectedFiles,  setSelectedFiles]  = useState<DuckDBFile[]>([])
+  const [fileSchemas,    setFileSchemas]     = useState<Record<string, SchemaRow[]>>({})
+  const [schemaLoadingFor, setSchemaLoadingFor] = useState<Set<string>>(new Set())
+  const [showSchema,     setShowSchema]     = useState(false)
+  const [sql,            setSql]            = useState('-- Select files on the left, then write SQL\n-- Ctrl+Enter to run\n')
+  const [result,         setResult]         = useState<QueryResult | null>(null)
+  const [rowLimit,       setRowLimit]       = useState('500')
 
-  // Auto-select from URL params (linked from RunDetail)
+  // ── Auto-select from URL params (linked from RunDetail) ───────────────────
   useEffect(() => {
     const p = new URLSearchParams(location.search)
     const path = p.get('path')
     if (!path) return
-    setSelectedFile({
+    const file: DuckDBFile = {
       s3_path:     path,
       pipeline_id: p.get('pipeline') ?? '',
       run_id:      p.get('run')      ?? '',
       task_id:     p.get('task')     ?? '',
-      table_name:  p.get('table')    ?? 'result',
-    })
-    const tbl = p.get('table') || p.get('task') || 'result'
-    setSql(`SELECT *\nFROM ${tbl}\nLIMIT 100`)
+      table_name:  p.get('table')    ?? null,
+    }
+    setSelectedFiles([file])
+    setSql('-- Discovering table…')
   }, [location.search])
 
-  // Load schema when file changes: SHOW TABLES → discover real name → DESCRIBE
+  // ── Load schema for each newly selected file (SHOW TABLES → DESCRIBE) ─────
   useEffect(() => {
-    if (!selectedFile) { setSchema([]); return }
-    setSchemaLoading(true)
-    setSchema([])
+    selectedFiles.forEach(f => {
+      if (f.s3_path in fileSchemas) return  // already loaded
+      if (schemaLoadingFor.has(f.s3_path)) return  // already in flight
 
-    const headers = {
-      'Content-Type': 'application/json',
-      'Authorization': `Bearer ${localStorage.getItem('df_token') ?? ''}`,
-    }
-    const baseBody = {
-      pipeline_id: selectedFile.pipeline_id,
-      run_id:      selectedFile.run_id,
-      task_id:     selectedFile.task_id,
-      duckdb_path: selectedFile.s3_path,
-      limit:       200,
-    }
+      setSchemaLoadingFor(s => new Set([...s, f.s3_path]))
 
-    // Step 1: discover the actual table name inside the DuckDB file
-    fetch('/api/query', {
-      method: 'POST',
-      headers,
-      body: JSON.stringify({ ...baseBody, sql: 'SHOW TABLES', limit: 10 }),
-    })
-      .then(r => r.json())
-      .then(res => {
-        const nameIdx = (res?.columns ?? []).indexOf('name')
-        let tbl = selectedFile.table_name || 'result'
-        if (nameIdx >= 0 && res.rows?.length > 0) {
-          tbl = res.rows[0][nameIdx]
-        }
-        // Update SQL editor with real table name
-        setSql(`SELECT *\nFROM ${tbl}\nLIMIT 100`)
-        setSelectedFile(prev => prev ? { ...prev, table_name: tbl } : prev)
+      const headers = {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${localStorage.getItem('df_token') ?? ''}`,
+      }
+      const base = {
+        pipeline_id: f.pipeline_id, run_id: f.run_id, task_id: f.task_id,
+        duckdb_path: f.s3_path, limit: 200,
+      }
 
-        // Step 2: describe the discovered table
-        return fetch('/api/query', {
-          method: 'POST',
-          headers,
-          body: JSON.stringify({ ...baseBody, sql: `DESCRIBE ${tbl}`, limit: 200 }),
+      fetch('/api/query', { method: 'POST', headers, body: JSON.stringify({ ...base, sql: 'SHOW TABLES', limit: 10 }) })
+        .then(r => r.json())
+        .then(res => {
+          const nameIdx = (res?.columns ?? []).indexOf('name')
+          let tbl = f.table_name || 'result'
+          if (nameIdx >= 0 && res.rows?.length > 0) tbl = res.rows[0][nameIdx]
+
+          // Store discovered table name on the file object
+          setSelectedFiles(prev =>
+            prev.map(p => p.s3_path === f.s3_path ? { ...p, table_name: tbl } : p),
+          )
+
+          return fetch('/api/query', {
+            method: 'POST', headers,
+            body: JSON.stringify({ ...base, sql: `DESCRIBE ${tbl}`, limit: 200 }),
+          })
         })
-      })
-      .then(r => r.json())
-      .then(res => {
-        if (res?.columns && res?.rows) {
-          const colIdx = res.columns.indexOf('column_name')
-          const typIdx = res.columns.indexOf('column_type')
-          if (colIdx >= 0 && typIdx >= 0) {
-            setSchema(res.rows.map((r: any[]) => ({
-              column_name: r[colIdx],
-              column_type: r[typIdx],
-            })))
+        .then(r => r.json())
+        .then(res => {
+          if (res?.columns && res?.rows) {
+            const ci = res.columns.indexOf('column_name')
+            const ti = res.columns.indexOf('column_type')
+            if (ci >= 0 && ti >= 0) {
+              setFileSchemas(prev => ({
+                ...prev,
+                [f.s3_path]: res.rows.map((r: any[]) => ({
+                  column_name: r[ci], column_type: r[ti],
+                })),
+              }))
+            }
           }
-        }
-      })
-      .catch(() => {})
-      .finally(() => setSchemaLoading(false))
-  }, [selectedFile?.s3_path])
+        })
+        .catch(() => {})
+        .finally(() => setSchemaLoadingFor(s => { const n = new Set(s); n.delete(f.s3_path); return n }))
+    })
+  }, [selectedFiles.map(f => f.s3_path).join(',')])
 
+  // ── Auto-update SQL when selection changes ────────────────────────────────
+  useEffect(() => {
+    if (selectedFiles.length === 0) { setSql('-- Select files on the left, then write SQL\n-- Ctrl+Enter to run\n'); return }
+    // Wait for at least the first file to have a table name
+    const firstTable = selectedFiles[0]?.table_name
+    if (!firstTable) return
+
+    if (selectedFiles.length === 1) {
+      setSql(`SELECT *\nFROM ${firstTable}\nLIMIT 100`)
+    } else {
+      const header = selectedFiles.map((f, i) =>
+        `-- [${i + 1}] alias: ${fileAlias(f)}${f.table_name ? `  table: ${fileAlias(f)}.${f.table_name}` : ''}`
+      ).join('\n')
+      const alias1 = fileAlias(selectedFiles[0])
+      const alias2 = fileAlias(selectedFiles[1])
+      setSql(
+        `${header}\n\nSELECT *\nFROM ${alias1}.${firstTable}\nJOIN ${alias2}.${selectedFiles[1].table_name ?? '???'} ON ???\nLIMIT 100`,
+      )
+    }
+  }, [selectedFiles.map(f => f.s3_path + ':' + (f.table_name ?? '')).join(',')])
+
+  // ── File toggle ───────────────────────────────────────────────────────────
+  function toggleFile(f: DuckDBFile) {
+    setSelectedFiles(prev => {
+      const idx = prev.findIndex(p => p.s3_path === f.s3_path)
+      if (idx >= 0) {
+        const next = prev.filter((_, i) => i !== idx)
+        // Remove schema for deselected file
+        setFileSchemas(s => { const n = { ...s }; delete n[f.s3_path]; return n })
+        return next
+      }
+      return [...prev, f]
+    })
+    setResult(null)
+  }
+
+  function removeFile(s3_path: string) {
+    setSelectedFiles(prev => prev.filter(f => f.s3_path !== s3_path))
+    setFileSchemas(prev => { const n = { ...prev }; delete n[s3_path]; return n })
+    setResult(null)
+  }
+
+  function clearAll() {
+    setSelectedFiles([])
+    setFileSchemas({})
+    setResult(null)
+    setSql('-- Select files on the left, then write SQL\n-- Ctrl+Enter to run\n')
+  }
+
+  // ── Snippets ──────────────────────────────────────────────────────────────
+  function applySnippet(fn: (t: string, multi: boolean) => string) {
+    const primary = selectedFiles[0]
+    const tbl     = primary?.table_name || 'result'
+    setSql(fn(tbl, selectedFiles.length > 1))
+  }
+
+  // ── Query execution ───────────────────────────────────────────────────────
   const queryMut = useMutation({
-    mutationFn: () => queryDuckDB({
-      pipeline_id: selectedFile?.pipeline_id ?? '',
-      run_id:      selectedFile?.run_id      ?? '',
-      task_id:     selectedFile?.task_id     ?? '',
-      duckdb_path: selectedFile?.s3_path     ?? '',
-      sql,
-      limit: parseInt(rowLimit, 10),
-    }),
+    mutationFn: () => {
+      const [primary, ...rest] = selectedFiles
+      return queryDuckDB({
+        pipeline_id: primary?.pipeline_id ?? '',
+        run_id:      primary?.run_id      ?? '',
+        task_id:     primary?.task_id     ?? '',
+        duckdb_path: primary?.s3_path     ?? '',
+        additional_paths: rest.length > 0
+          ? rest.map(f => ({ path: f.s3_path, alias: fileAlias(f) }))
+          : undefined,
+        sql,
+        limit: parseInt(rowLimit, 10),
+      })
+    },
     onSuccess: (res) => {
       setResult(res)
       toast.success(`${res.row_count.toLocaleString()} rows · ${res.duration_ms}ms`)
     },
     onError: (e: any) => {
-      const msg = e.response?.data?.detail ?? e.message ?? 'Query failed'
-      toast.error(msg)
+      toast.error(e.response?.data?.detail ?? e.message ?? 'Query failed')
     },
   })
 
   const runQuery = useCallback(() => {
-    if (!selectedFile) { toast.error('Select a file first'); return }
+    if (!selectedFiles.length) { toast.error('Select at least one file'); return }
     queryMut.mutate()
-  }, [selectedFile, sql, rowLimit])
+  }, [selectedFiles, sql, rowLimit])
 
-  function handleFileSelect(f: DuckDBFile) {
-    setSelectedFile(f)
-    setResult(null)
-    setSql('-- Discovering table…')
-  }
-
-  function applySnippet(fn: (t: string) => string) {
-    const tbl = selectedFile?.table_name || 'result'
-    setSql(fn(tbl))
-  }
-
-  const fileName   = selectedFile?.s3_path?.split('/').slice(-1)[0] ?? ''
-  const tableName  = selectedFile?.table_name || 'result'
+  const primaryTable = selectedFiles[0]?.table_name || 'result'
 
   return (
     <div className="flex flex-col h-full overflow-hidden bg-gray-50">
@@ -512,92 +542,108 @@ export default function QueryEditor() {
           <Database size={16} className="text-blue-600" />
           <div>
             <h1 className="text-sm font-bold text-gray-900">Query Editor</h1>
-            <p className="text-xs text-gray-400">Ad-hoc SQL over any DuckDB pipeline output</p>
+            <p className="text-xs text-gray-400">Ad-hoc SQL over DuckDB pipeline outputs · supports cross-file JOINs</p>
           </div>
         </div>
-        {selectedFile && (
-          <div className="flex items-center gap-2 bg-blue-50 border border-blue-200 rounded-lg px-3 py-1.5">
-            <Database size={11} className="text-blue-500" />
-            <div className="text-xs">
-              <span className="font-mono text-blue-700 font-semibold">{selectedFile.pipeline_id}</span>
-              <span className="text-blue-400 mx-1">›</span>
-              <span className="font-mono text-blue-600">{selectedFile.task_id}</span>
-              {selectedFile.run_id && (
-                <span className="text-blue-400 ml-1 hidden lg:inline">· {formatRunId(selectedFile.run_id)}</span>
-              )}
-            </div>
-          </div>
+        {selectedFiles.length > 0 && (
+          <button onClick={clearAll}
+            className="text-xs text-gray-500 hover:text-red-600 flex items-center gap-1 transition-colors">
+            <X size={11} /> Clear all
+          </button>
         )}
       </div>
 
-      {/* Body: file browser + editor */}
+      {/* Body */}
       <div className="flex flex-1 overflow-hidden">
         {/* File browser */}
         <FileBrowser
-          selectedPath={selectedFile?.s3_path}
-          onSelect={handleFileSelect}
-          onRefresh={() => setFilesKey(k => k + 1)}
+          selectedPaths={selectedFiles.map(f => f.s3_path)}
+          onToggle={toggleFile}
+          onRefresh={() => setResult(null)}
         />
 
-        {/* Editor + results */}
-        <div className="flex-1 flex flex-col overflow-hidden">
-          {/* Schema panel */}
-          <SchemaPanel schema={schema} loading={schemaLoading} />
-
-          {/* SQL editor section */}
-          <div className="bg-white border-b border-gray-200 flex-shrink-0">
-            {/* Editor toolbar */}
-            <div className="flex items-center justify-between px-4 py-2 border-b border-gray-100">
-              {/* Snippets */}
-              <div className="flex items-center gap-1.5 flex-wrap">
-                <span className="text-xs text-gray-400 mr-1">Quick:</span>
-                {SNIPPETS.map(s => (
-                  <button
-                    key={s.label}
-                    onClick={() => applySnippet(s.sql)}
-                    disabled={!selectedFile}
-                    className="text-xs text-gray-600 hover:text-blue-700 hover:bg-blue-50 border border-gray-200 hover:border-blue-200 px-2 py-0.5 rounded transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
-                  >
-                    {s.label}
+        {/* Center: editor + results */}
+        <div className="flex-1 flex flex-col overflow-hidden min-w-0">
+          {/* Selected files chips */}
+          {selectedFiles.length > 0 && (
+            <div className="flex items-center gap-2 px-4 py-2 bg-blue-50/60 border-b border-blue-100 flex-shrink-0 flex-wrap">
+              <Link2 size={11} className="text-blue-500 flex-shrink-0" />
+              <span className="text-xs text-blue-600 font-medium flex-shrink-0">
+                {selectedFiles.length === 1 ? 'Querying:' : `Joining ${selectedFiles.length} tables:`}
+              </span>
+              {selectedFiles.map((f, i) => (
+                <div key={f.s3_path}
+                  className="flex items-center gap-1 bg-white border border-blue-200 rounded-full px-2.5 py-0.5 text-xs text-blue-700 shadow-sm">
+                  <span className="w-4 h-4 rounded-full bg-blue-500 text-white flex items-center justify-center text-xs font-bold flex-shrink-0">
+                    {i + 1}
+                  </span>
+                  <span className="font-mono">{f.table_name || f.task_id}</span>
+                  {selectedFiles.length > 1 && (
+                    <span className="text-blue-400 font-mono text-xs">({fileAlias(f)})</span>
+                  )}
+                  <button onClick={() => removeFile(f.s3_path)}
+                    className="text-blue-300 hover:text-red-500 ml-0.5 transition-colors">
+                    <X size={10} />
                   </button>
-                ))}
-              </div>
-              {/* Run controls */}
-              <div className="flex items-center gap-2 flex-shrink-0">
-                <div className="flex items-center gap-1.5">
-                  <span className="text-xs text-gray-400">Limit:</span>
-                  <select
-                    value={rowLimit}
-                    onChange={e => setRowLimit(e.target.value)}
-                    className="bg-white border border-gray-300 rounded px-2 py-0.5 text-xs text-gray-700 focus:outline-none focus:ring-1 focus:ring-blue-500"
-                  >
-                    {['100', '500', '1000', '5000', '10000'].map(n => (
-                      <option key={n} value={n}>{Number(n).toLocaleString()}</option>
-                    ))}
-                  </select>
                 </div>
-                <span className="text-xs text-gray-300 hidden xl:block">Ctrl+Enter</span>
-                <button
-                  onClick={runQuery}
-                  disabled={!selectedFile || queryMut.isPending}
-                  className="flex items-center gap-1.5 text-xs font-medium text-white bg-blue-600 hover:bg-blue-500 disabled:opacity-40 disabled:cursor-not-allowed px-3 py-1.5 rounded-lg transition-colors shadow-sm"
-                >
-                  {queryMut.isPending
-                    ? <><Spinner size="sm" /> Running…</>
-                    : <><Play size={12} /> Run Query</>
-                  }
-                </button>
-              </div>
+              ))}
             </div>
+          )}
 
-            {/* Monaco */}
-            {!selectedFile && (
-              <div className="px-4 py-2 bg-amber-50 border-b border-amber-100">
-                <p className="text-xs text-amber-700 flex items-center gap-1.5">
-                  <XCircle size={11} /> Select a pipeline output from the panel on the left
-                </p>
+          {/* Editor toolbar */}
+          <div className="flex items-center justify-between px-4 py-2 border-b border-gray-200 bg-white flex-shrink-0">
+            <div className="flex items-center gap-1.5 flex-wrap">
+              <span className="text-xs text-gray-400 mr-1">Quick:</span>
+              {SNIPPETS.map(s => (
+                <button key={s.label} onClick={() => applySnippet(s.sql)}
+                  disabled={!selectedFiles.length}
+                  className="text-xs text-gray-600 hover:text-blue-700 hover:bg-blue-50 border border-gray-200 hover:border-blue-200 px-2 py-0.5 rounded transition-colors disabled:opacity-40 disabled:cursor-not-allowed">
+                  {s.label}
+                </button>
+              ))}
+            </div>
+            <div className="flex items-center gap-2 flex-shrink-0">
+              <div className="flex items-center gap-1.5">
+                <span className="text-xs text-gray-400">Limit:</span>
+                <select value={rowLimit} onChange={e => setRowLimit(e.target.value)}
+                  className="bg-white border border-gray-300 rounded px-2 py-0.5 text-xs text-gray-700 focus:outline-none focus:ring-1 focus:ring-blue-500">
+                  {['100', '500', '1000', '5000', '10000'].map(n => (
+                    <option key={n} value={n}>{Number(n).toLocaleString()}</option>
+                  ))}
+                </select>
               </div>
-            )}
+              <button
+                onClick={() => setShowSchema(s => !s)}
+                className={clsx(
+                  'flex items-center gap-1 text-xs px-2.5 py-1.5 rounded-lg border transition-colors',
+                  showSchema
+                    ? 'bg-blue-600 text-white border-blue-600'
+                    : 'bg-white text-gray-600 border-gray-300 hover:bg-gray-50',
+                )}
+              >
+                <Columns size={11} /> Schema
+              </button>
+              <span className="text-xs text-gray-300 hidden xl:block">Ctrl+Enter</span>
+              <button onClick={runQuery}
+                disabled={!selectedFiles.length || queryMut.isPending}
+                className="flex items-center gap-1.5 text-xs font-medium text-white bg-blue-600 hover:bg-blue-500 disabled:opacity-40 disabled:cursor-not-allowed px-3 py-1.5 rounded-lg transition-colors shadow-sm">
+                {queryMut.isPending
+                  ? <><Spinner size="sm" /> Running…</>
+                  : <><Play size={12} /> Run Query</>
+                }
+              </button>
+            </div>
+          </div>
+
+          {/* Monaco */}
+          {!selectedFiles.length && (
+            <div className="px-4 py-2 bg-amber-50 border-b border-amber-100 flex-shrink-0">
+              <p className="text-xs text-amber-700 flex items-center gap-1.5">
+                <XCircle size={11} /> Select a pipeline output from the panel on the left
+              </p>
+            </div>
+          )}
+          <div className="flex-shrink-0 border-b border-gray-200 bg-white">
             <Editor
               height="200px"
               language="sql"
@@ -605,20 +651,14 @@ export default function QueryEditor() {
               value={sql}
               onChange={v => setSql(v ?? '')}
               options={{
-                minimap: { enabled: false },
-                fontSize: 13,
-                lineNumbers: 'on',
-                scrollBeyondLastLine: false,
-                wordWrap: 'on',
-                tabSize: 2,
-                automaticLayout: true,
-                padding: { top: 10, bottom: 10 },
-                suggestOnTriggerCharacters: true,
+                minimap: { enabled: false }, fontSize: 13, lineNumbers: 'on',
+                scrollBeyondLastLine: false, wordWrap: 'on', tabSize: 2,
+                automaticLayout: true, padding: { top: 10, bottom: 10 },
               }}
               onMount={(editor, monaco) => {
                 editor.addCommand(
                   monaco.KeyMod.CtrlCmd | monaco.KeyCode.Enter,
-                  () => { if (selectedFile) queryMut.mutate() },
+                  () => { if (selectedFiles.length) queryMut.mutate() },
                 )
               }}
             />
@@ -632,26 +672,52 @@ export default function QueryEditor() {
                 <span className="text-sm">Executing query…</span>
               </div>
             )}
-
             {!queryMut.isPending && !result && (
               <div className="flex flex-col items-center justify-center flex-1 gap-3 text-gray-300">
                 <Play size={32} strokeWidth={1.5} />
                 <div className="text-center">
                   <p className="text-sm font-medium text-gray-400">
-                    {selectedFile ? `Table: ${tableName}` : 'No file selected'}
+                    {selectedFiles.length
+                      ? selectedFiles.length > 1
+                        ? `${selectedFiles.length} tables selected — write a JOIN query`
+                        : `Table: ${primaryTable}`
+                      : 'No file selected'}
                   </p>
                   <p className="text-xs text-gray-300 mt-1">
-                    {selectedFile ? 'Click "Run Query" or press Ctrl+Enter' : 'Pick a pipeline output from the left panel'}
+                    {selectedFiles.length
+                      ? 'Click "Run Query" or press Ctrl+Enter'
+                      : 'Pick a pipeline output from the left panel'}
                   </p>
                 </div>
               </div>
             )}
-
-            {!queryMut.isPending && result && (
-              <ResultsTable result={result} />
-            )}
+            {!queryMut.isPending && result && <ResultsTable result={result} />}
           </div>
         </div>
+
+        {/* Schema panel (right, collapsible) */}
+        {showSchema && (
+          <div className="w-72 flex-shrink-0 border-l border-gray-200 bg-white flex flex-col overflow-hidden">
+            <div className="px-3 py-2.5 border-b border-gray-100 flex items-center justify-between bg-gray-50">
+              <div className="flex items-center gap-1.5">
+                <Columns size={12} className="text-blue-500" />
+                <span className="text-xs font-semibold text-gray-700">Schema</span>
+                {selectedFiles.length > 0 && (
+                  <span className="text-xs text-gray-400">· {selectedFiles.length} table{selectedFiles.length > 1 ? 's' : ''}</span>
+                )}
+              </div>
+              <button onClick={() => setShowSchema(false)}
+                className="text-gray-400 hover:text-gray-600 p-1 rounded hover:bg-gray-100 transition-colors">
+                <X size={12} />
+              </button>
+            </div>
+            <SchemaPanel
+              files={selectedFiles}
+              schemas={fileSchemas}
+              loadingFor={schemaLoadingFor}
+            />
+          </div>
+        )}
       </div>
     </div>
   )
