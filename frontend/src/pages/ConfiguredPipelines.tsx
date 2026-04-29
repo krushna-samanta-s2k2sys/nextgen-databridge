@@ -54,7 +54,7 @@ function PipelineList({
 
   const pipelines: any[] = (data?.pipelines ?? []).filter((p: any) => {
     if (!search) return true
-    const id = (p.id || p.pipeline_id || '').toLowerCase()
+    const id = (p.pipeline_id || p.id || '').toLowerCase()
     return id.includes(search.toLowerCase())
   })
 
@@ -95,7 +95,7 @@ function PipelineList({
           </div>
         )}
         {pipelines.map((p: any) => {
-          const pid = p.id || p.pipeline_id
+          const pid = p.pipeline_id || p.id
           const isSelected = pid === selectedId
           return (
             <div
@@ -152,14 +152,14 @@ function PipelineDetail({ pipelineId }: { pipelineId: string }) {
       <div className="flex items-start justify-between">
         <div>
           <div className="flex items-center gap-3 mb-1">
-            <h2 className="text-lg font-bold text-gray-900 font-mono">{p.id || p.pipeline_id}</h2>
+            <h2 className="text-lg font-bold text-gray-900 font-mono">{p.pipeline_id || p.id}</h2>
             <StatusBadge status={p.status ?? 'active'} />
           </div>
           {p.description && <p className="text-sm text-gray-500">{p.description}</p>}
         </div>
         <div className="flex items-center gap-2">
           <button
-            onClick={() => nav(`/runs?pipeline_id=${p.id || p.pipeline_id}`)}
+            onClick={() => nav(`/runs?pipeline_id=${p.pipeline_id || p.id}`)}
             className="flex items-center gap-1.5 text-xs text-blue-600 hover:text-blue-700 bg-blue-50 hover:bg-blue-100 border border-blue-200 px-3 py-1.5 rounded-lg transition-colors"
           >
             View runs <ArrowRight size={11} />
@@ -269,7 +269,7 @@ function PipelineDetail({ pipelineId }: { pipelineId: string }) {
               <div className="flex items-center gap-2">
                 <FileJson size={15} className="text-blue-600" />
                 <h3 className="text-sm font-semibold text-gray-900">Pipeline Config JSON</h3>
-                <span className="text-xs text-gray-400 font-mono">{p.id || p.pipeline_id}</span>
+                <span className="text-xs text-gray-400 font-mono">{p.pipeline_id || p.id}</span>
               </div>
               <button
                 onClick={() => setShowJson(false)}

@@ -407,28 +407,48 @@ export default function QueryEditor() {
     setSql(`SELECT *\nFROM ${tbl}\nLIMIT 100`)
   }, [location.search])
 
-  // Load schema when file changes
+  // Load schema when file changes: SHOW TABLES → discover real name → DESCRIBE
   useEffect(() => {
     if (!selectedFile) { setSchema([]); return }
-    const tbl = selectedFile.table_name || 'result'
     setSchemaLoading(true)
     setSchema([])
-    const body = {
+
+    const headers = {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${localStorage.getItem('df_token') ?? ''}`,
+    }
+    const baseBody = {
       pipeline_id: selectedFile.pipeline_id,
       run_id:      selectedFile.run_id,
       task_id:     selectedFile.task_id,
       duckdb_path: selectedFile.s3_path,
-      sql:         `DESCRIBE ${tbl}`,
       limit:       200,
     }
+
+    // Step 1: discover the actual table name inside the DuckDB file
     fetch('/api/query', {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${localStorage.getItem('df_token') ?? ''}`,
-      },
-      body: JSON.stringify(body),
+      headers,
+      body: JSON.stringify({ ...baseBody, sql: 'SHOW TABLES', limit: 10 }),
     })
+      .then(r => r.json())
+      .then(res => {
+        const nameIdx = (res?.columns ?? []).indexOf('name')
+        let tbl = selectedFile.table_name || 'result'
+        if (nameIdx >= 0 && res.rows?.length > 0) {
+          tbl = res.rows[0][nameIdx]
+        }
+        // Update SQL editor with real table name
+        setSql(`SELECT *\nFROM ${tbl}\nLIMIT 100`)
+        setSelectedFile(prev => prev ? { ...prev, table_name: tbl } : prev)
+
+        // Step 2: describe the discovered table
+        return fetch('/api/query', {
+          method: 'POST',
+          headers,
+          body: JSON.stringify({ ...baseBody, sql: `DESCRIBE ${tbl}`, limit: 200 }),
+        })
+      })
       .then(r => r.json())
       .then(res => {
         if (res?.columns && res?.rows) {
@@ -473,17 +493,16 @@ export default function QueryEditor() {
   function handleFileSelect(f: DuckDBFile) {
     setSelectedFile(f)
     setResult(null)
-    const tbl = f.table_name || f.task_id || 'result'
-    setSql(`SELECT *\nFROM ${tbl}\nLIMIT 100`)
+    setSql('-- Discovering table…')
   }
 
   function applySnippet(fn: (t: string) => string) {
-    const tbl = selectedFile?.table_name || selectedFile?.task_id || 'result'
+    const tbl = selectedFile?.table_name || 'result'
     setSql(fn(tbl))
   }
 
   const fileName   = selectedFile?.s3_path?.split('/').slice(-1)[0] ?? ''
-  const tableName  = selectedFile?.table_name || selectedFile?.task_id || 'result'
+  const tableName  = selectedFile?.table_name || 'result'
 
   return (
     <div className="flex flex-col h-full overflow-hidden bg-gray-50">
