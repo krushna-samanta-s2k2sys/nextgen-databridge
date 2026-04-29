@@ -32,7 +32,7 @@ env:
   TF_VERSION: "~1.6"
   STATE_BUCKET: nextgen-databridge-terraform-state
   LOCK_TABLE: nextgen-databridge-terraform-locks
-  CLUSTER_NAME: nextgen-databridge-dev
+  CLUSTER_NAME: nextgen-databridge
 
 jobs:
   # ── Guard: pass through on merge; always pass on manual dispatch ─────────────
