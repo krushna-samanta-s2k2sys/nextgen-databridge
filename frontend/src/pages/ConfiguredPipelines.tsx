@@ -5,7 +5,7 @@ import Editor from '@monaco-editor/react'
 import { getPipelines, getPipeline } from '../api/client'
 import { StatusBadge, Card, Spinner } from '../components/ui'
 import {
-  Search, Settings2, ChevronRight, Clock, Tag,
+  Search, Settings2, ChevronRight, ChevronDown, Clock, Tag,
   Users, AlertTriangle, Database, Server, ArrowRight,
   FileJson, X, RefreshCw, XCircle,
 } from 'lucide-react'
@@ -127,7 +127,7 @@ function PipelineList({
 }
 
 function getTaskSql(t: any): string | null {
-  return t.transform_sql || t.source?.sql || t.sql || null
+  return t.sql || t.transform_sql || t.source?.query || t.source?.sql || null
 }
 
 // ── Right panel: pipeline detail ──────────────────────────────────────────────
