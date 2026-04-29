@@ -161,6 +161,7 @@ jobs:
           TF_VAR_db_password: ${{ secrets.DB_PASSWORD }}
           TF_VAR_mssql_password: ${{ secrets.MSSQL_PASSWORD }}
         run: |
+          set -o pipefail
           terraform plan \
             -var="environment=${{ inputs.environment }}" \
             -var="aws_region=${{ needs.setup.outputs.aws_region }}" \
@@ -211,6 +212,7 @@ jobs:
           TF_VAR_db_password: ${{ secrets.DB_PASSWORD }}
           TF_VAR_mssql_password: ${{ secrets.MSSQL_PASSWORD }}
         run: |
+          set -o pipefail
           terraform plan \
             -var="environment=${{ inputs.environment }}" \
             -var="aws_region=${{ needs.setup.outputs.aws_region }}" \
@@ -261,6 +263,7 @@ jobs:
           TF_VAR_db_password: ${{ secrets.DB_PASSWORD }}
           TF_VAR_mssql_password: ${{ secrets.MSSQL_PASSWORD }}
         run: |
+          set -o pipefail
           terraform plan \
             -var="environment=${{ inputs.environment }}" \
             -var="aws_region=${{ needs.setup.outputs.aws_region }}" \
