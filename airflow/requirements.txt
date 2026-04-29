@@ -4,3 +4,4 @@ duckdb==1.0.0
 pandas
 pymssql
 kafka-python
+kubernetes
