@@ -1212,7 +1212,10 @@ async def query_duckdb(
 
         # Allow SELECT, DESCRIBE, SHOW, and SUMMARIZE; reject all mutating statements
         safe_sql  = req.sql.strip().rstrip(";")
-        sql_upper = safe_sql.upper().lstrip()
+        # Strip leading SQL line comments (-- ...) before prefix check so queries
+        # that start with comment headers (e.g. auto-generated JOIN templates) are accepted
+        stripped_for_check = re.sub(r"(^\s*--[^\n]*\n?)+", "", safe_sql, flags=re.MULTILINE).lstrip()
+        sql_upper = stripped_for_check.upper()
         ALLOWED_PREFIXES = ("SELECT", "DESCRIBE", "SHOW", "SUMMARIZE", "PRAGMA")
         if not any(sql_upper.startswith(p) for p in ALLOWED_PREFIXES):
             raise HTTPException(400, "Only SELECT / DESCRIBE / SHOW / SUMMARIZE queries are allowed in Query Explorer")
