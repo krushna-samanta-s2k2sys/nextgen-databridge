@@ -1,0 +1,10 @@
+# Enforce LF line endings for files that run on Linux, regardless of developer OS.
+# Without this, Windows git checkouts produce CRLF, which corrupts bash env vars
+# (trailing \r gets embedded in variable values like bucket names).
+*.sh        text eol=lf
+*.sh.tpl    text eol=lf
+*.py        text eol=lf
+
+# Terraform files use the host OS line endings (Terraform handles them natively)
+*.tf        text eol=lf
+*.tfvars    text eol=lf

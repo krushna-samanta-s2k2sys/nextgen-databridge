@@ -1142,7 +1142,11 @@ class EKSJobOperator(NextGenDatabridgeBaseOperator):
         task_id  = self.task_config["task_id"]
         ti       = context["ti"]
 
-        job_name = f"df-{self.pipeline_id[:20]}-{task_id[:20]}-{run_id[-8:]}".lower().replace("_", "-")
+        # Kubernetes names must be RFC 1123 subdomains: [a-z0-9-], max 63 chars,
+        # start/end alphanumeric. run_id contains '+' and ':' from ISO timestamps.
+        import re as _re
+        _raw = f"df-{self.pipeline_id[:20]}-{task_id[:20]}-{run_id[-16:]}".lower()
+        job_name = _re.sub(r"-+", "-", _re.sub(r"[^a-z0-9-]", "-", _raw)).strip("-")[:63].rstrip("-")
         out_s3   = self.duckdb_s3_path(run_id, task_id)
 
         start_ts = datetime.now(timezone.utc)

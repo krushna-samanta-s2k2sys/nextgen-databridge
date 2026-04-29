@@ -187,6 +187,27 @@ resource "aws_security_group" "mwaa" {
   }
 }
 
+# Grant the MWAA execution role permission to create/watch Jobs in the
+# nextgen-databridge-jobs namespace. Without this the EKS API returns 401.
+resource "aws_eks_access_entry" "mwaa" {
+  cluster_name  = data.aws_eks_cluster.main.name
+  principal_arn = aws_iam_role.mwaa_execution.arn
+  type          = "STANDARD"
+}
+
+resource "aws_eks_access_policy_association" "mwaa_edit" {
+  cluster_name  = data.aws_eks_cluster.main.name
+  principal_arn = aws_iam_role.mwaa_execution.arn
+  policy_arn    = "arn:aws:eks::aws:cluster-access-policy/AmazonEKSEditPolicy"
+
+  access_scope {
+    type       = "namespace"
+    namespaces = ["nextgen-databridge-jobs"]
+  }
+
+  depends_on = [aws_eks_access_entry.mwaa]
+}
+
 # Allow MWAA workers to call the EKS API server (port 443) so EKSJobOperator
 # can submit Kubernetes Jobs without routing through load_incluster_config.
 resource "aws_vpc_security_group_ingress_rule" "eks_from_mwaa" {
@@ -223,28 +244,18 @@ resource "aws_s3_object" "mwaa_requirements" {
 }
 
 # Startup script reads dynamic values (DB URL) from Secrets Manager at worker boot.
-# Only static, code-level values (bucket names, env name) are embedded here.
+# Rendered from startup.sh.tpl which is committed with LF line endings (.gitattributes).
 resource "aws_s3_object" "mwaa_startup" {
   bucket       = aws_s3_bucket.mwaa.id
   key          = "startup.sh"
   content_type = "text/x-sh"
-  content      = <<-SCRIPT
-    #!/usr/bin/env bash
-    _SM=$(aws secretsmanager get-secret-value \
-      --region "${var.aws_region}" \
-      --secret-id "nextgen-databridge/connections/audit_db" \
-      --query SecretString --output text 2>/dev/null || echo '{}')
-    export _SM
-    export NEXTGEN_DATABRIDGE_AUDIT_DB_URL=$(python3 -c \
-      "import json,os; d=json.loads(os.environ['_SM']); print(d.get('url',''))")
-    unset _SM
-    export NEXTGEN_DATABRIDGE_DUCKDB_BUCKET="${local.duckdb_store_bucket}"
-    export NEXTGEN_DATABRIDGE_PIPELINE_CONFIGS_BUCKET="${local.pipeline_configs_bucket}"
-    export NEXTGEN_DATABRIDGE_ENV="${var.environment}"
-    export NEXTGEN_DATABRIDGE_ECR_REGISTRY="${data.aws_caller_identity.current.account_id}.dkr.ecr.${var.aws_region}.amazonaws.com"
-    export AWS_DEFAULT_REGION="${var.aws_region}"
-    export EKS_CLUSTER_NAME="nextgen-databridge"
-  SCRIPT
+  content = templatefile("${path.module}/startup.sh.tpl", {
+    aws_region             = var.aws_region
+    duckdb_store_bucket    = local.duckdb_store_bucket
+    pipeline_configs_bucket = local.pipeline_configs_bucket
+    environment            = var.environment
+    ecr_registry           = "${data.aws_caller_identity.current.account_id}.dkr.ecr.${var.aws_region}.amazonaws.com"
+  })
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
