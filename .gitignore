@@ -1,3 +1,5 @@
+# Ignore Terraform directories and provider binaries
+.terraform/
 # Python
 __pycache__/
 *.py[cod]
