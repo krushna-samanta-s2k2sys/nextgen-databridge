@@ -126,10 +126,22 @@ function PipelineList({
   )
 }
 
+function getTaskSql(t: any): string | null {
+  return t.transform_sql || t.source?.sql || t.sql || null
+}
+
 // ── Right panel: pipeline detail ──────────────────────────────────────────────
 function PipelineDetail({ pipelineId }: { pipelineId: string }) {
   const nav = useNavigate()
   const [showJson, setShowJson] = useState(false)
+  const [expandedSql, setExpandedSql] = useState<Set<string | number>>(new Set())
+  function toggleSql(key: string | number) {
+    setExpandedSql(prev => {
+      const next = new Set(prev)
+      if (next.has(key)) next.delete(key); else next.add(key)
+      return next
+    })
+  }
 
   const { data: pipeline, isLoading, isError, error } = useQuery({
     queryKey: ['pipeline', pipelineId],
@@ -249,6 +261,27 @@ function PipelineDetail({ pipelineId }: { pipelineId: string }) {
                     {t.target.table && <> → <span className="font-mono">{t.target.schema}.{t.target.table}</span></>}
                   </p>
                 )}
+                {getTaskSql(t) && (() => {
+                  const key = t.task_id ?? i
+                  const sql = getTaskSql(t)!
+                  const isOpen = expandedSql.has(key)
+                  return (
+                    <div className="mt-2">
+                      <button
+                        onClick={() => toggleSql(key)}
+                        className="flex items-center gap-1 text-xs text-blue-600 hover:text-blue-800 font-medium transition-colors"
+                      >
+                        {isOpen ? <ChevronDown size={11} /> : <ChevronRight size={11} />}
+                        {isOpen ? 'Hide SQL' : 'Show SQL'}
+                      </button>
+                      {isOpen && (
+                        <pre className="mt-1.5 text-xs font-mono bg-gray-900 text-gray-100 rounded-lg px-3 py-2.5 overflow-x-auto max-h-72 leading-relaxed whitespace-pre-wrap break-words">
+                          {sql}
+                        </pre>
+                      )}
+                    </div>
+                  )
+                })()}
               </div>
               {t.execution && (
                 <div className="text-right flex-shrink-0">

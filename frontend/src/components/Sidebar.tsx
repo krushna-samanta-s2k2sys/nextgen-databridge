@@ -32,7 +32,7 @@ export function Sidebar() {
         </div>
         {sidebarOpen && (
           <div className="flex-1 min-w-0">
-            <span className="text-sm font-bold text-white block truncate">NextGenDatabridge</span>
+            <span className="text-sm font-bold text-white block truncate">Data Bridge</span>
             <span className="text-xs text-slate-500 block truncate">Monitor &amp; Explore</span>
           </div>
         )}

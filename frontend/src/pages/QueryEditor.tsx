@@ -9,7 +9,7 @@ import {
   Database, Search, RefreshCw, Play, Download, Copy,
   CheckCircle, ChevronDown, ChevronRight, XCircle,
   Hash, Type as TypeIcon, Clock, Rows, BarChart2,
-  Columns, X, Plus, Link2,
+  Columns, X, Plus, Link2, HelpCircle,
 } from 'lucide-react'
 import clsx from 'clsx'
 
@@ -364,6 +364,121 @@ function ResultsTable({ result }: { result: QueryResult }) {
   )
 }
 
+// ── Documentation Overlay ────────────────────────────────────────────────────
+function DocsOverlay({ onClose }: { onClose: () => void }) {
+  const section = 'mb-5'
+  const h2 = 'text-xs font-bold text-gray-700 uppercase tracking-wider mb-2 flex items-center gap-1.5'
+  const code = 'block bg-gray-900 text-gray-100 rounded-lg px-3 py-2.5 text-xs font-mono leading-relaxed whitespace-pre overflow-x-auto mt-1.5'
+  const p = 'text-xs text-gray-600 mb-1 leading-relaxed'
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-6 bg-black/50" onClick={onClose}>
+      <div
+        className="bg-white rounded-2xl shadow-2xl w-full max-w-2xl max-h-[85vh] flex flex-col"
+        onClick={e => e.stopPropagation()}
+      >
+        <div className="flex items-center justify-between px-5 py-4 border-b border-gray-200 flex-shrink-0">
+          <div className="flex items-center gap-2">
+            <HelpCircle size={15} className="text-blue-600" />
+            <h3 className="text-sm font-semibold text-gray-900">Query Editor Guide</h3>
+          </div>
+          <button onClick={onClose} className="text-gray-400 hover:text-gray-600 p-1 rounded hover:bg-gray-100">
+            <X size={16} />
+          </button>
+        </div>
+
+        <div className="flex-1 overflow-y-auto px-6 py-5">
+
+          <div className={section}>
+            <p className={h2}><Database size={12} /> Selecting Files</p>
+            <p className={p}>Click any file in the left panel to select it. Files are grouped by pipeline → run → task.</p>
+            <p className={p}>Select <strong>multiple files</strong> to enable cross-file JOINs. Selected files appear as numbered chips above the editor.</p>
+            <p className={p}>Click a chip's × to deselect. The "Clear all" button resets the entire selection.</p>
+          </div>
+
+          <div className={section}>
+            <p className={h2}><Database size={12} /> Single-file Query</p>
+            <p className={p}>After selecting a file, the editor auto-populates with a simple SELECT. The table name is discovered via <code className="bg-gray-100 px-1 rounded">SHOW TABLES</code> and shown in the Schema panel.</p>
+            <pre className={code}>{`SELECT * FROM inventory_valuation LIMIT 100
+
+-- Filter
+SELECT StockItemName, QuantityOnHand
+FROM inventory_valuation
+WHERE QuantityOnHand > 0
+ORDER BY QuantityOnHand DESC
+LIMIT 100`}</pre>
+          </div>
+
+          <div className={section}>
+            <p className={h2}><Link2 size={12} /> Multi-file JOINs</p>
+            <p className={p}>Each file is ATTACHed to an in-memory DuckDB using its <strong>task_id</strong> as the alias. Reference tables as <code className="bg-gray-100 px-1 rounded">alias.table_name</code>.</p>
+            <p className={p}>The comment headers in the editor tell you the exact alias and full reference for each selected file.</p>
+            <pre className={code}>{`-- [1] alias: extract_stock_holdings   table: extract_stock_holdings.raw_stock_holdings
+-- [2] alias: transform_inventory_valuation   table: transform_inventory_valuation.inventory_valuation
+
+SELECT
+  iv.StockItemID,
+  iv.StockItemName,
+  h.QuantityOnHand,
+  iv.StockCostValue
+FROM extract_stock_holdings.raw_stock_holdings h
+JOIN transform_inventory_valuation.inventory_valuation iv
+  ON h.StockItemID = iv.StockItemID
+WHERE h.QuantityOnHand > 0
+ORDER BY iv.StockCostValue DESC
+LIMIT 100`}</pre>
+          </div>
+
+          <div className={section}>
+            <p className={h2}><Columns size={12} /> Schema Discovery</p>
+            <p className={p}>Use the <strong>Schema</strong> button to toggle the schema panel. You can also run these directly in the editor:</p>
+            <pre className={code}>{`-- List all tables in the selected file
+SHOW TABLES
+
+-- Column names and types
+DESCRIBE inventory_valuation
+
+-- Column statistics (min, max, avg, nulls, distinct)
+SUMMARIZE SELECT * FROM inventory_valuation`}</pre>
+          </div>
+
+          <div className={section}>
+            <p className={h2}><BarChart2 size={12} /> Useful Patterns</p>
+            <pre className={code}>{`-- Row count
+SELECT COUNT(*) AS total FROM table_name
+
+-- Distinct values with frequency
+SELECT column, COUNT(*) AS cnt
+FROM table_name
+GROUP BY column
+ORDER BY cnt DESC
+LIMIT 50
+
+-- Null check
+SELECT COUNT(*) FILTER (WHERE column IS NULL) AS nulls,
+       COUNT(*) AS total
+FROM table_name
+
+-- Recent rows (if date column exists)
+SELECT * FROM table_name
+WHERE date_column >= '2025-01-01'
+ORDER BY date_column DESC
+LIMIT 100`}</pre>
+          </div>
+
+          <div className={section}>
+            <p className={h2}><Download size={12} /> Export &amp; Shortcuts</p>
+            <p className={p}>After running a query, use <strong>TSV</strong> or <strong>CSV</strong> buttons to download results.</p>
+            <p className={p}><kbd className="bg-gray-100 border border-gray-300 rounded px-1.5 py-0.5 text-xs font-mono">Ctrl+Enter</kbd> — run the current query</p>
+            <p className={p}>Row limit is configurable (100 – 10,000) in the toolbar dropdown.</p>
+          </div>
+
+        </div>
+      </div>
+    </div>
+  )
+}
+
 // ── Main Query Editor ─────────────────────────────────────────────────────────
 export default function QueryEditor() {
   const location = useLocation()
@@ -372,6 +487,7 @@ export default function QueryEditor() {
   const [fileSchemas,    setFileSchemas]     = useState<Record<string, SchemaRow[]>>({})
   const [schemaLoadingFor, setSchemaLoadingFor] = useState<Set<string>>(new Set())
   const [showSchema,     setShowSchema]     = useState(false)
+  const [showDocs,       setShowDocs]       = useState(false)
   const [sql,            setSql]            = useState('-- Select files on the left, then write SQL\n-- Ctrl+Enter to run\n')
   const [result,         setResult]         = useState<QueryResult | null>(null)
   const [rowLimit,       setRowLimit]       = useState('500')
@@ -623,6 +739,13 @@ export default function QueryEditor() {
               >
                 <Columns size={11} /> Schema
               </button>
+              <button
+                onClick={() => setShowDocs(true)}
+                className="flex items-center gap-1 text-xs px-2.5 py-1.5 rounded-lg border border-gray-300 bg-white text-gray-600 hover:bg-gray-50 transition-colors"
+                title="Query Editor Guide"
+              >
+                <HelpCircle size={11} /> Docs
+              </button>
               <span className="text-xs text-gray-300 hidden xl:block">Ctrl+Enter</span>
               <button onClick={runQuery}
                 disabled={!selectedFiles.length || queryMut.isPending}
@@ -720,5 +843,7 @@ export default function QueryEditor() {
         )}
       </div>
     </div>
+
+    {showDocs && <DocsOverlay onClose={() => setShowDocs(false)} />}
   )
 }

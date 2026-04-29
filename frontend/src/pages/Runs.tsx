@@ -4,7 +4,7 @@ import { useQuery } from '@tanstack/react-query'
 import { getRuns, getRun } from '../api/client'
 import { Card, CardHeader, StatusBadge, Spinner, Duration, TimeAgo } from '../components/ui'
 import {
-  CheckCircle, XCircle, Database, ChevronRight,
+  CheckCircle, XCircle, Database, ChevronRight, ChevronDown,
   Filter, Activity, Search, ExternalLink,
 } from 'lucide-react'
 import clsx from 'clsx'
@@ -113,7 +113,6 @@ export function Runs() {
                   <th className="px-4 py-3 text-left text-gray-500 font-semibold">Started</th>
                   <th className="px-4 py-3 text-left text-gray-500 font-semibold">Duration</th>
                   <th className="px-4 py-3 text-left text-gray-500 font-semibold">Tasks</th>
-                  <th className="px-4 py-3 text-left text-gray-500 font-semibold">Rows</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-gray-100">
@@ -124,7 +123,7 @@ export function Runs() {
                     onClick={() => nav(`/runs/${r.run_id}`)}
                   >
                     <td className="px-5 py-3 font-mono font-semibold text-blue-600">{r.pipeline_id}</td>
-                    <td className="px-4 py-3 font-mono text-gray-400 text-xs">{r.run_id?.slice(-16)}</td>
+                    <td className="px-4 py-3 font-mono text-gray-500 text-xs break-all" title={r.run_id}>{r.run_id}</td>
                     <td className="px-4 py-3"><StatusBadge status={r.status} /></td>
                     <td className="px-4 py-3 text-gray-500"><TimeAgo ts={r.start_time} /></td>
                     <td className="px-4 py-3 text-gray-500"><Duration seconds={r.duration_seconds} /></td>
@@ -133,7 +132,6 @@ export function Runs() {
                       <span className="text-gray-400">/{r.total_tasks ?? 0}</span>
                       {r.failed_tasks > 0 && <span className="text-red-500 ml-1">({r.failed_tasks}✗)</span>}
                     </td>
-                    <td className="px-4 py-3 font-mono text-gray-700">{(r.total_rows_processed ?? 0).toLocaleString()}</td>
                   </tr>
                 ))}
               </tbody>
@@ -170,6 +168,15 @@ export function RunDetail() {
   const running   = tasks.filter((t: any) => t.status === 'running')
   const succeeded = tasks.filter((t: any) => t.status === 'success')
 
+  const [expandedItems, setExpandedItems] = useState<Set<string>>(new Set())
+  function toggleItem(key: string) {
+    setExpandedItems(prev => {
+      const next = new Set(prev)
+      if (next.has(key)) next.delete(key); else next.add(key)
+      return next
+    })
+  }
+
   function queryLink(t: any): string {
     if (!t.output_duckdb_path) return ''
     const params = new URLSearchParams({
@@ -203,8 +210,8 @@ export function RunDetail() {
           <h1 className="text-lg font-bold text-gray-900 font-mono">{run.pipeline_id}</h1>
           <StatusBadge status={run.status} />
         </div>
-        <p className="text-xs text-gray-400 font-mono mb-4">{runId}</p>
-        <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+        <p className="text-xs text-gray-400 font-mono mb-4 break-all">{runId}</p>
+        <div className="grid grid-cols-2 md:grid-cols-3 gap-4">
           <div>
             <p className="text-xs text-gray-400 mb-0.5">Started</p>
             <p className="text-sm font-medium text-gray-700"><TimeAgo ts={run.start_time} /></p>
@@ -212,10 +219,6 @@ export function RunDetail() {
           <div>
             <p className="text-xs text-gray-400 mb-0.5">Duration</p>
             <p className="text-sm font-medium text-gray-700"><Duration seconds={run.duration_seconds} /></p>
-          </div>
-          <div>
-            <p className="text-xs text-gray-400 mb-0.5">Rows Processed</p>
-            <p className="text-sm font-mono font-semibold text-gray-900">{(run.total_rows_processed ?? 0).toLocaleString()}</p>
           </div>
           <div>
             <p className="text-xs text-gray-400 mb-0.5">Tasks</p>
@@ -270,11 +273,44 @@ export function RunDetail() {
                     )}
                   </div>
 
-                  {t.error_message && (
-                    <p className="text-xs text-red-600 mt-1.5 font-mono bg-red-50 border border-red-100 px-2.5 py-1.5 rounded-lg truncate">
-                      {t.error_message}
-                    </p>
-                  )}
+                  {t.error_message && (() => {
+                    const key = `${t.task_run_id}_err`
+                    const expanded = expandedItems.has(key)
+                    return (
+                      <div className="mt-1.5">
+                        <p className={clsx(
+                          'text-xs text-red-600 font-mono bg-red-50 border border-red-100 px-2.5 py-1.5 rounded-lg',
+                          !expanded && 'truncate',
+                          expanded && 'whitespace-pre-wrap break-words',
+                        )}>
+                          {t.error_message}
+                        </p>
+                        <button onClick={() => toggleItem(key)}
+                          className="flex items-center gap-0.5 text-xs text-red-400 hover:text-red-600 mt-0.5 transition-colors">
+                          {expanded ? <><ChevronDown size={10} /> Show less</> : <><ChevronRight size={10} /> Show full error</>}
+                        </button>
+                      </div>
+                    )
+                  })()}
+
+                  {(t.sql || t.transform_sql || t.query) && (() => {
+                    const key = `${t.task_run_id}_sql`
+                    const expanded = expandedItems.has(key)
+                    const sqlText = t.sql || t.transform_sql || t.query
+                    return (
+                      <div className="mt-1.5">
+                        <button onClick={() => toggleItem(key)}
+                          className="flex items-center gap-0.5 text-xs text-gray-400 hover:text-blue-600 transition-colors">
+                          {expanded ? <><ChevronDown size={10} /> Hide SQL</> : <><ChevronRight size={10} /> Show SQL</>}
+                        </button>
+                        {expanded && (
+                          <pre className="mt-1 text-xs font-mono bg-gray-900 text-gray-100 rounded-lg px-3 py-2.5 overflow-x-auto max-h-56 leading-relaxed whitespace-pre-wrap break-words">
+                            {sqlText}
+                          </pre>
+                        )}
+                      </div>
+                    )
+                  })()}
 
                   {t.output_row_count != null && (
                     <p className="text-xs text-gray-500 mt-1 flex items-center gap-1.5">
