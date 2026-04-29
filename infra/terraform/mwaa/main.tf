@@ -221,6 +221,7 @@ resource "aws_s3_object" "mwaa_startup" {
     export NEXTGEN_DATABRIDGE_DUCKDB_BUCKET="${local.duckdb_store_bucket}"
     export NEXTGEN_DATABRIDGE_PIPELINE_CONFIGS_BUCKET="${local.pipeline_configs_bucket}"
     export NEXTGEN_DATABRIDGE_ENV="${var.environment}"
+    export NEXTGEN_DATABRIDGE_ECR_REGISTRY="${data.aws_caller_identity.current.account_id}.dkr.ecr.${var.aws_region}.amazonaws.com"
     export AWS_DEFAULT_REGION="${var.aws_region}"
     export EKS_CLUSTER_NAME="nextgen-databridge"
   SCRIPT

@@ -4,7 +4,6 @@ from contextlib import asynccontextmanager
 from typing import AsyncGenerator
 
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
-from sqlalchemy.pool import NullPool
 
 from models.models import Base
 
@@ -17,13 +16,15 @@ CONFIG_DB_URL = os.getenv(
     "postgresql+asyncpg://nextgen_databridge:nextgen_databridge@localhost:5432/nextgen_databridge_config"
 )
 
-# Main audit/runtime engine
+# pool_size=5 per replica (2 replicas = 10 total connections against RDS).
+# connect_args timeout=10 prevents a blocked DB from hanging startup for 300s.
 engine = create_async_engine(
     DATABASE_URL,
     echo=False,
-    pool_size=20,
-    max_overflow=10,
+    pool_size=5,
+    max_overflow=5,
     pool_pre_ping=True,
+    connect_args={"timeout": 10},
 )
 
 AsyncSessionLocal = async_sessionmaker(

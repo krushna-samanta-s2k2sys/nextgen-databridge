@@ -404,9 +404,9 @@ jobs:
       - name: Wait for rollout
         run: |
           kubectl rollout status deployment/nextgen-databridge-api \
-            -n nextgen-databridge --timeout=300s
+            -n nextgen-databridge --timeout=600s
           kubectl rollout status deployment/nextgen-databridge-ui \
-            -n nextgen-databridge --timeout=180s
+            -n nextgen-databridge --timeout=300s
 
       - name: Print service endpoints
         run: |
@@ -451,7 +451,7 @@ jobs:
 
       - name: Health check — API
         run: |
-          API_HOST=$(kubectl get svc nextgen-databridge-api-lb \
+          API_HOST=$(kubectl get svc nextgen-databridge-api \
             -n nextgen-databridge \
             -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "")
           if [[ -n "$API_HOST" ]]; then

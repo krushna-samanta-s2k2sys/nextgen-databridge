@@ -45,6 +45,10 @@ from operators.config_loader import load_active_pipeline_configs
 
 logger = logging.getLogger("nextgen_databridge.dag_generator")
 
+# Resolved once at DAG-bag import time from the MWAA startup-script env vars.
+_ECR_REGISTRY = os.getenv("NEXTGEN_DATABRIDGE_ECR_REGISTRY", "")
+_ENV          = os.getenv("NEXTGEN_DATABRIDGE_ENV", "dev")
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Operator factory
 # ─────────────────────────────────────────────────────────────────────────────
@@ -167,14 +171,19 @@ def _make_task(task_config: dict, dag: DAG, pipeline_config: dict):
             **execution.get("env_vars", {}),
             "OPERATION_TYPE": operation_type,
         }
+        default_image = (
+            f"{_ECR_REGISTRY}/nextgen-databridge/transform:{_ENV}"
+            if _ECR_REGISTRY
+            else f"nextgen-databridge/transform:{_ENV}"
+        )
         common_kwargs.update({
-            "image": execution.get("image", f"nextgen-databridge/transform:{pipeline_config.get('version', 'latest')}"),
+            "image": execution.get("image", default_image),
             "cpu_request": execution.get("cpu", "1"),
             "memory_request": execution.get("memory", "2Gi"),
             "cpu_limit": execution.get("cpu_limit", execution.get("cpu", "2")),
             "memory_limit": execution.get("memory_limit", execution.get("memory", "4Gi")),
             "namespace": execution.get("namespace", "nextgen-databridge-jobs"),
-            "eks_cluster_name": os.getenv("EKS_CLUSTER_NAME", "nextgen-databridge-eks"),
+            "eks_cluster_name": os.getenv("EKS_CLUSTER_NAME", "nextgen-databridge"),
             "service_account": execution.get("service_account", "nextgen-databridge-task-runner"),
             "env_vars": eks_env,
         })

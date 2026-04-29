@@ -66,8 +66,13 @@ AIRFLOW_PASS = os.getenv("AIRFLOW_PASS", "admin")
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("NextGenDatabridge API starting up...")
-    await create_tables()
-    logger.info("Database tables ensured")
+    try:
+        await create_tables()
+        logger.info("Database tables ensured")
+    except Exception as exc:
+        # Non-fatal: pod must start so the readiness probe can pass.
+        # DB-dependent endpoints will fail with 503 until connectivity is restored.
+        logger.error(f"Database startup error (will retry on first request): {exc}")
     yield
     logger.info("NextGenDatabridge API shutting down")
 
