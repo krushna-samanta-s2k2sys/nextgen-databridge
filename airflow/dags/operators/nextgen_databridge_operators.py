@@ -1248,6 +1248,14 @@ class EKSJobOperator(NextGenDatabridgeBaseOperator):
                         spec=k8s_client.V1PodSpec(
                             restart_policy="Never",
                             service_account_name=self.service_account,
+                            tolerations=[
+                                k8s_client.V1Toleration(
+                                    key="nextgen-databridge-job",
+                                    operator="Equal",
+                                    value="true",
+                                    effect="NoSchedule",
+                                )
+                            ],
                             containers=[
                                 k8s_client.V1Container(
                                     name="transform",

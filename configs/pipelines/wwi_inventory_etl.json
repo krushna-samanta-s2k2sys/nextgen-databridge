@@ -49,7 +49,7 @@
       "task_id": "extract_stock_transactions",
       "type": "sql_extract",
       "engine": "eks",
-      "execution": { "memory": "8Gi", "cpu": "2" },
+      "execution": { "cpu": "500m", "memory": "2Gi", "cpu_limit": "1", "memory_limit": "4Gi" },
       "source": {
         "connection": "wwi_sqlserver",
         "query": "SELECT t.StockItemTransactionID, t.StockItemID, t.TransactionTypeID, t.CustomerID, t.SupplierID, t.TransactionOccurredWhen, t.Quantity FROM Warehouse.StockItemTransactions t WHERE t.TransactionOccurredWhen >= DATEADD(day, -30, GETDATE())",
