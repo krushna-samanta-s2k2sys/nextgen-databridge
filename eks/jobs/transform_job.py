@@ -177,6 +177,8 @@ def execute_extract(task_config: dict, output_path: str, run_id: str):
     if not query:
         raise ValueError("task_config.source.query is required for extract")
 
+    ds = os.getenv("DS", "")
+    query = query.replace("{{ ds }}", ds).replace("{{ds}}", ds)
     query = query.replace("{{ run_id }}", run_id).replace("{{run_id}}", run_id)
 
     logger.info(f"Fetching credentials for connection: {conn_name}")

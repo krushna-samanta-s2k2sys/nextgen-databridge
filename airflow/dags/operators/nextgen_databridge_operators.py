@@ -344,6 +344,12 @@ class SQLExtractOperator(NextGenDatabridgeBaseOperator):
             query     = source.get("query", f"SELECT * FROM {source.get('table', 'unknown')}")
             batch_size = source.get("batch_size", 100_000)
 
+            # Render Jinja-style template variables in the query before sending to the DB.
+            # Airflow does NOT auto-render operator fields that aren't in template_fields.
+            ds = context.get("ds", "")
+            query = query.replace("{{ ds }}", ds).replace("{{ds}}", ds)
+            query = query.replace("{{ run_id }}", run_id).replace("{{run_id}}", run_id)
+
             # Resolve Airflow connection
             try:
                 from airflow.hooks.base import BaseHook
@@ -1224,6 +1230,7 @@ class EKSJobOperator(NextGenDatabridgeBaseOperator):
                 k8s_client.V1EnvVar(name="PIPELINE_ID", value=self.pipeline_id),
                 k8s_client.V1EnvVar(name="RUN_ID", value=run_id),
                 k8s_client.V1EnvVar(name="TASK_ID", value=task_id),
+                k8s_client.V1EnvVar(name="DS", value=context.get("ds", "")),
                 k8s_client.V1EnvVar(name="OUTPUT_DUCKDB_PATH", value=out_s3),
                 k8s_client.V1EnvVar(name="INPUT_PATHS", value=json.dumps(input_paths)),
                 k8s_client.V1EnvVar(name="TASK_CONFIG", value=json.dumps(self.task_config)),
