@@ -28,6 +28,15 @@ locals {
   duckdb_store_bucket     = "nextgen-databridge-duckdb-store-${var.environment}"
   pipeline_configs_bucket = "nextgen-databridge-pipeline-configs-${var.environment}"
   artifacts_bucket        = "nextgen-databridge-artifacts-${var.environment}"
+
+  # Content hash of plugin source files — stable across zip regenerations.
+  # archive_file produces non-deterministic zip metadata in CI (file timestamps
+  # differ each fresh checkout), so etag = output_md5 would change every run.
+  # source_hash bypasses the archive and hashes the actual source content instead.
+  plugins_content_hash = sha256(join("", [
+    for f in sort(fileset("${path.module}/../../../airflow/plugins", "**")) :
+    filesha256("${path.module}/../../../airflow/plugins/${f}")
+  ]))
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -189,10 +198,10 @@ data "archive_file" "mwaa_plugins" {
 }
 
 resource "aws_s3_object" "mwaa_plugins" {
-  bucket = aws_s3_bucket.mwaa.id
-  key    = "plugins.zip"
-  source = data.archive_file.mwaa_plugins.output_path
-  etag   = data.archive_file.mwaa_plugins.output_md5
+  bucket      = aws_s3_bucket.mwaa.id
+  key         = "plugins.zip"
+  source      = data.archive_file.mwaa_plugins.output_path
+  source_hash = local.plugins_content_hash
 }
 
 resource "aws_s3_object" "mwaa_requirements" {
