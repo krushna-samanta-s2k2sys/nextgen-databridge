@@ -119,15 +119,16 @@ def write_task_run(status: str, **fields):
         cur.execute("""
             INSERT INTO task_runs (
                 id, task_run_id, run_id, pipeline_id, task_id, task_type,
-                status, output_duckdb_path, output_row_count, output_size_bytes,
+                status, output_duckdb_path, output_table, output_row_count, output_size_bytes,
                 start_time, end_time, duration_seconds,
                 error_message, error_traceback, worker_host, created_at, updated_at
             ) VALUES (
-                %s,%s,%s,%s,%s,%s, %s,%s,%s,%s, %s,%s,%s, %s,%s,%s, NOW(),NOW()
+                %s,%s,%s,%s,%s,%s, %s,%s,%s,%s,%s, %s,%s,%s, %s,%s,%s, NOW(),NOW()
             )
             ON CONFLICT (task_run_id) DO UPDATE SET
                 status=EXCLUDED.status,
                 output_duckdb_path=EXCLUDED.output_duckdb_path,
+                output_table=EXCLUDED.output_table,
                 output_row_count=EXCLUDED.output_row_count,
                 end_time=EXCLUDED.end_time,
                 duration_seconds=EXCLUDED.duration_seconds,
@@ -140,6 +141,7 @@ def write_task_run(status: str, **fields):
             fields.get("task_id"), fields.get("task_type"),
             status,
             fields.get("output_duckdb_path"),
+            fields.get("output_table"),
             fields.get("output_row_count"),
             fields.get("output_size_bytes"),
             fields.get("start_time"), fields.get("end_time"),
@@ -309,15 +311,17 @@ def main():
         else:
             row_count, size_bytes = execute_transform(task_config, input_paths, output_path, run_id)
 
-        end_time = datetime.now(timezone.utc)
-        duration = (end_time - start_time).total_seconds()
+        output_table = task_config.get("output", {}).get("table")
+        end_time     = datetime.now(timezone.utc)
+        duration     = (end_time - start_time).total_seconds()
 
         write_task_run(
             "success",
             task_run_id=task_run_id, run_id=run_id, pipeline_id=pipeline_id,
             task_id=task_id, task_type=f"eks_{operation_type}",
             start_time=start_time, end_time=end_time, duration_seconds=duration,
-            output_duckdb_path=output_path, output_row_count=row_count, output_size_bytes=size_bytes,
+            output_duckdb_path=output_path, output_table=output_table,
+            output_row_count=row_count, output_size_bytes=size_bytes,
         )
         logger.info(f"Job SUCCESS: {row_count:,} rows -> {output_path} in {duration:.1f}s")
         sys.exit(0)

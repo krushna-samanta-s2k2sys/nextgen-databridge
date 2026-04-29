@@ -424,7 +424,7 @@ export function QueryExplorer() {
                   key={f.s3_path}
                   onClick={() => {
                     setSelectedFile(f)
-                    setSql(`-- ${f.task_id}\nSELECT *\nFROM result\nLIMIT 100`)
+                    setSql(`-- ${f.task_id}\nSELECT *\nFROM ${f.table_name || 'result'}\nLIMIT 100`)
                   }}
                   className={clsx(
                     'px-3 py-2.5 cursor-pointer border-b border-gray-50 transition-colors',

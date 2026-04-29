@@ -1227,20 +1227,31 @@ async def list_duckdb_files(
     db: AsyncSession = Depends(get_db),
     current_user: dict = Depends(maybe_token),
 ):
-    q = select(DuckDBFile).order_by(desc(DuckDBFile.created_at))
-    if pipeline_id: q = q.where(DuckDBFile.pipeline_id == pipeline_id)
-    if run_id:      q = q.where(DuckDBFile.run_id == run_id)
+    # Source from task_runs — the duckdb_files registry is populated by operators
+    # that don't exist yet, but task_runs is written by every EKS job on completion.
+    q = (
+        select(TaskRun)
+        .where(TaskRun.output_duckdb_path.isnot(None))
+        .where(TaskRun.status == "success")
+        .order_by(desc(TaskRun.created_at))
+    )
+    if pipeline_id: q = q.where(TaskRun.pipeline_id == pipeline_id)
+    if run_id:      q = q.where(TaskRun.run_id == run_id)
     q = q.limit(500)
     result = await db.execute(q)
-    files = result.scalars().all()
+    rows = result.scalars().all()
     return {"files": [
         {
-            "s3_path": f.s3_path, "pipeline_id": f.pipeline_id,
-            "run_id": f.run_id, "task_id": f.task_id, "table_name": f.table_name,
-            "row_count": f.row_count, "size_bytes": f.size_bytes,
-            "created_at": f.created_at.isoformat() if f.created_at else None,
+            "s3_path":     t.output_duckdb_path,
+            "pipeline_id": t.pipeline_id,
+            "run_id":      t.run_id,
+            "task_id":     t.task_id,
+            "table_name":  t.output_table,
+            "row_count":   t.output_row_count,
+            "size_bytes":  t.output_size_bytes,
+            "created_at":  t.created_at.isoformat() if t.created_at else None,
         }
-        for f in files
+        for t in rows
     ]}
 
 
