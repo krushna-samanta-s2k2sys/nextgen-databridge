@@ -255,11 +255,26 @@ resource "aws_mwaa_environment" "main" {
   }
 
   logging_configuration {
-    dag_processing_logs { enabled = true; log_level = "INFO" }
-    scheduler_logs      { enabled = true; log_level = "INFO" }
-    task_logs           { enabled = true; log_level = "INFO" }
-    webserver_logs      { enabled = true; log_level = "INFO" }
-    worker_logs         { enabled = true; log_level = "INFO" }
+    dag_processing_logs {
+      enabled   = true
+      log_level = "INFO"
+    }
+    scheduler_logs {
+      enabled   = true
+      log_level = "INFO"
+    }
+    task_logs {
+      enabled   = true
+      log_level = "INFO"
+    }
+    webserver_logs {
+      enabled   = true
+      log_level = "INFO"
+    }
+    worker_logs {
+      enabled   = true
+      log_level = "INFO"
+    }
   }
 
   airflow_configuration_options = {
