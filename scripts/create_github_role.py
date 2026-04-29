@@ -218,6 +218,12 @@ def build_policies(account_id: str, region: str) -> dict[str, dict]:
                         "s3:GetBucketWebsite",
                         "s3:PutBucketWebsite",
                         "s3:DeleteBucketWebsite",
+                        "s3:GetAccelerateConfiguration",
+                        "s3:PutAccelerateConfiguration",
+                        "s3:GetBucketRequestPayment",
+                        "s3:PutBucketRequestPayment",
+                        "s3:GetBucketOwnershipControls",
+                        "s3:PutBucketOwnershipControls",
                     ],
                     "Resource": [
                         f"arn:aws:s3:::{PROJECT}-terraform-state",
@@ -760,13 +766,23 @@ def build_policies(account_id: str, region: str) -> dict[str, dict]:
                     ),
                 },
                 {
-                    "Sid": "CloudWatchLogs",
+                    # DescribeLogGroups/Streams are list APIs — AWS requires Resource:* for them
+                    "Sid": "CloudWatchLogsDescribe",
+                    "Effect": "Allow",
+                    "Action": [
+                        "logs:DescribeLogGroups",
+                        "logs:DescribeLogStreams",
+                        "logs:ListTagsLogGroup",
+                        "logs:ListTagsForResource",
+                    ],
+                    "Resource": "*",
+                },
+                {
+                    "Sid": "CloudWatchLogsWrite",
                     "Effect": "Allow",
                     "Action": [
                         "logs:CreateLogGroup",
                         "logs:DeleteLogGroup",
-                        "logs:DescribeLogGroups",
-                        "logs:DescribeLogStreams",
                         "logs:CreateLogStream",
                         "logs:DeleteLogStream",
                         "logs:PutLogEvents",
@@ -780,11 +796,8 @@ def build_policies(account_id: str, region: str) -> dict[str, dict]:
                         "logs:UntagLogGroup",
                         "logs:TagResource",
                         "logs:UntagResource",
-                        "logs:ListTagsLogGroup",
-                        "logs:ListTagsForResource",
                     ],
                     "Resource": [
-                        # EKS cluster log group — uses bare project name (no env suffix)
                         f"arn:aws:logs:{region}:{account_id}:log-group:/aws/eks/{PROJECT}",
                         f"arn:aws:logs:{region}:{account_id}:log-group:/aws/eks/{PROJECT}:*",
                         f"arn:aws:logs:{region}:{account_id}:log-group:/aws/eks/{PROJECT}/*",
