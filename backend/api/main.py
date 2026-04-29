@@ -1189,12 +1189,19 @@ async def query_duckdb(
         # Execute query with row limit
         conn = ddb.connect(local_path, read_only=True)
 
-        # Wrap with limit for safety
-        safe_sql = req.sql.strip().rstrip(";")
-        if not safe_sql.upper().startswith("SELECT"):
-            raise HTTPException(400, "Only SELECT queries are allowed in Query Explorer")
+        # Allow SELECT, DESCRIBE, SHOW, and SUMMARIZE; reject all mutating statements
+        safe_sql  = req.sql.strip().rstrip(";")
+        sql_upper = safe_sql.upper().lstrip()
+        ALLOWED_PREFIXES = ("SELECT", "DESCRIBE", "SHOW", "SUMMARIZE", "PRAGMA")
+        if not any(sql_upper.startswith(p) for p in ALLOWED_PREFIXES):
+            raise HTTPException(400, "Only SELECT / DESCRIBE / SHOW / SUMMARIZE queries are allowed in Query Explorer")
 
-        limited_sql = f"SELECT * FROM ({safe_sql}) _q LIMIT {req.limit}"
+        # SELECT gets wrapped with a row-limit subquery; others run directly
+        if sql_upper.startswith("SELECT") or sql_upper.startswith("SUMMARIZE"):
+            limited_sql = f"SELECT * FROM ({safe_sql}) _q LIMIT {req.limit}"
+        else:
+            limited_sql = safe_sql
+
         result = conn.execute(limited_sql)
         columns = [desc[0] for desc in result.description]
         rows    = result.fetchall()
