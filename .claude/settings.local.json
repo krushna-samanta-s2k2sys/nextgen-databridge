@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python scripts/create_github_role.py --repo \"krushna-samanta-s2k2sys/nextgen-databridge\" --role-name \"nextgen-databridge-github-actions-dev\" --env dev --region us-east-1)"
+    ]
+  }
+}
