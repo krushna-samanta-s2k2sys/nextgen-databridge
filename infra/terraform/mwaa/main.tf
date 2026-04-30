@@ -283,7 +283,7 @@ resource "aws_mwaa_environment" "main" {
 
   network_configuration {
     security_group_ids = [aws_security_group.mwaa.id]
-    subnet_ids         = slice(tolist(data.aws_subnets.private.ids), 0, 2)
+    subnet_ids         = slice(tolist(data.aws_subnets.private.ids), 0, min(2, length(data.aws_subnets.private.ids)))
   }
 
   logging_configuration {

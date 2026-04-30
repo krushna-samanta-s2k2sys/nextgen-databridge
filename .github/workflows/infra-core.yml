@@ -157,15 +157,43 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
-  # PLAN — mwaa (runs after apply-core so it can see new VPC/EKS outputs;
-  #              when action=plan, apply-core is skipped and this still runs)
+  # ── Check whether core infra already exists ──────────────────────────────────
+  # Runs in parallel with plan-core. Its output gates plan-mwaa so that
+  # action=plan against a fresh (post-cleanup) environment doesn't try to plan
+  # MWAA against a VPC/EKS cluster that doesn't exist yet.
+  check-core:
+    name: Check core prerequisites
+    runs-on: ubuntu-latest
+    needs: [setup, bootstrap]
+    outputs:
+      eks_exists: ${{ steps.check.outputs.eks_exists }}
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ needs.setup.outputs.role_arn }}
+          aws-region: ${{ needs.setup.outputs.aws_region }}
+      - name: Check EKS cluster
+        id: check
+        run: |
+          STATUS=$(aws eks describe-cluster --name "nextgen-databridge" \
+            --query 'cluster.status' --output text 2>/dev/null || echo "NOT_FOUND")
+          echo "EKS cluster status: ${STATUS}"
+          [[ "$STATUS" == "ACTIVE" ]] \
+            && echo "eks_exists=true"  >> "$GITHUB_OUTPUT" \
+            || echo "eks_exists=false" >> "$GITHUB_OUTPUT"
+
+  # PLAN — mwaa
+  # Runs after apply-core when action=apply/destroy.
+  # When action=plan (apply-core is skipped), only runs if EKS already exists —
+  # prevents data-source failures against a freshly wiped environment.
   plan-mwaa:
     name: Plan — mwaa
     runs-on: ubuntu-latest
-    needs: [setup, apply-core]
+    needs: [setup, apply-core, check-core]
     if: |
       always() &&
-      (needs.apply-core.result == 'success' || needs.apply-core.result == 'skipped')
+      (needs.apply-core.result == 'success' ||
+       (needs.apply-core.result == 'skipped' && needs.check-core.outputs.eks_exists == 'true'))
     steps:
       - uses: actions/checkout@v4
       - uses: aws-actions/configure-aws-credentials@v4
@@ -257,11 +285,12 @@ jobs:
   apply-mwaa:
     name: "${{ inputs.action == 'destroy' && 'Destroy' || 'Apply' }} — mwaa"
     runs-on: ubuntu-latest
-    needs: [setup, plan-mwaa, apply-core]
+    needs: [setup, plan-mwaa, apply-core, check-core]
     if: |
       inputs.action != 'plan' &&
       needs.plan-mwaa.result == 'success' &&
-      (needs.apply-core.result == 'success' || needs.apply-core.result == 'skipped')
+      (needs.apply-core.result == 'success' ||
+       (needs.apply-core.result == 'skipped' && needs.check-core.outputs.eks_exists == 'true'))
     environment: ${{ inputs.environment }}
     steps:
       - uses: actions/checkout@v4
