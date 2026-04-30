@@ -23,7 +23,7 @@ from airflow.hooks.base import BaseHook
 from airflow.models import Variable
 
 # NextGenDatabridge imports
-from operators.nextgen_databridge_operators import (
+from operators import (
     SQLExtractOperator,
     DuckDBTransformOperator,
     DataQualityOperator,
@@ -34,6 +34,11 @@ from operators.nextgen_databridge_operators import (
     EKSJobOperator,
     LoadTargetOperator,
     NotificationOperator,
+)
+from action_triggers import (
+    APICallOperator,
+    AutosysJobOperator,
+    StoredProcOperator,
 )
 from operators.nextgen_databridge_callbacks import (
     on_success_callback,
@@ -68,6 +73,9 @@ OPERATOR_MAP: Dict[str, type] = {
     "eks_job":           EKSJobOperator,
     "load_target":       LoadTargetOperator,
     "notification":      NotificationOperator,
+    "api_call":          APICallOperator,
+    "autosys_job":       AutosysJobOperator,
+    "stored_proc":       StoredProcOperator,
 }
 
 

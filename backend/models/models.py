@@ -76,6 +76,9 @@ class TaskType(PyEnum):
     CONDITIONAL_BRANCH = "conditional_branch"
     LOAD_TARGET = "load_target"
     NOTIFICATION = "notification"
+    API_CALL = "api_call"
+    AUTOSYS_JOB = "autosys_job"
+    STORED_PROC = "stored_proc"
 
 class ConnectionType(PyEnum):
     SQLSERVER = "sqlserver"

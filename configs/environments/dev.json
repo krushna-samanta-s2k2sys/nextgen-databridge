@@ -26,6 +26,17 @@
       "port": 1433,
       "database": "TargetDB",
       "secret_name": "nextgen-databridge/connections/wwi_sqlserver_target"
+    },
+    "domedit_oracle": {
+      "airflow_conn_id": "domedit_oracle",
+      "type": "oracle",
+      "host": "domedit-db.corp.internal",
+      "port": 1521,
+      "service_name": "DOMEDIT",
+      "schema": "SCHEMA1",
+      "driver": "oracledb",
+      "secret_name": "nextgen-databridge/connections/domedit_oracle",
+      "notes": "DOMEDIT Oracle DB — thin-mode oracledb (no Instant Client required). Credentials stored in Secrets Manager."
     }
   },
 
