@@ -66,6 +66,7 @@ data:
   PIPELINE_CONFIGS_BUCKET: "__PIPELINE_CONFIGS_BUCKET__"
   AWS_DEFAULT_REGION: "us-east-1"
   AIRFLOW_URL: "__AIRFLOW_URL__"
+  MWAA_ENV_NAME: "nextgen-databridge"
   NEXTGEN_DATABRIDGE_API_URL: "http://nextgen-databridge-api.nextgen-databridge.svc.cluster.local:8000"
   NEXTGEN_DATABRIDGE_ENV: "__ENVIRONMENT__"
 
