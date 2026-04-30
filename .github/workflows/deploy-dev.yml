@@ -197,7 +197,7 @@ jobs:
     name: Sync DAGs to MWAA
     runs-on: ubuntu-latest
     needs: [guard, validate-infra]
-    if: needs.guard.outputs.sync_dags == 'true'
+    if: needs.guard.outputs.sync_dags == 'true' || needs.guard.outputs.deploy_apps == 'true'
     steps:
       - uses: actions/checkout@v4
       - uses: aws-actions/configure-aws-credentials@v4
@@ -431,6 +431,57 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
           [[ "$FAILED" -eq 0 ]] || { echo "::error::${FAILED} pipeline(s) failed to register."; exit 1; }
+
+      - name: Unpause MWAA DAGs
+        run: |
+          MWAA_HOST=$(aws mwaa get-environment --name "nextgen-databridge" \
+            --query "Environment.WebserverUrl" --output text 2>/dev/null || echo "")
+          if [[ -z "$MWAA_HOST" ]]; then
+            echo "MWAA not reachable — skipping unpause."
+            exit 0
+          fi
+          TOKEN=$(aws mwaa create-web-login-token --name "nextgen-databridge" \
+            --query "WebToken" --output text 2>/dev/null || echo "")
+          if [[ -z "$TOKEN" ]]; then
+            echo "::warning::Could not obtain MWAA token — DAGs may remain paused."
+            exit 0
+          fi
+          for f in configs/pipelines/*.json; do
+            PIPELINE_ID=$(jq -r '.pipeline_id' "$f")
+            STATUS=$(curl -sf -o /dev/null -w "%{http_code}" -X PATCH \
+              "https://${MWAA_HOST}/api/v1/dags/${PIPELINE_ID}" \
+              -H "Authorization: Bearer ${TOKEN}" \
+              -H "Content-Type: application/json" \
+              -d '{"is_paused": false}')
+            if [[ "$STATUS" =~ ^2 ]]; then
+              echo "  ✓ Unpaused ${PIPELINE_ID}"
+            else
+              echo "  ⚠ Unpause returned HTTP ${STATUS} for ${PIPELINE_ID}"
+            fi
+          done
+
+      - name: Sync historical MWAA runs to PostgreSQL
+        run: |
+          pip install psycopg2-binary --quiet 2>/dev/null
+
+          MWAA_HOST=$(aws mwaa get-environment --name "nextgen-databridge" \
+            --query "Environment.WebserverUrl" --output text 2>/dev/null || echo "")
+          TOKEN=$(aws mwaa create-web-login-token --name "nextgen-databridge" \
+            --query "WebToken" --output text 2>/dev/null || echo "")
+          DB_SECRET=$(aws secretsmanager get-secret-value \
+            --secret-id "nextgen-databridge/connections/audit_db" \
+            --query SecretString --output text 2>/dev/null || echo "{}")
+          DB_URL=$(echo "$DB_SECRET" | jq -r '.url // ""')
+
+          if [[ -z "$MWAA_HOST" || -z "$TOKEN" || -z "$DB_URL" ]]; then
+            echo "Missing prerequisites — skipping historical run sync."
+            exit 0
+          fi
+
+          PIPELINE_IDS=$(for f in configs/pipelines/*.json; do jq '.pipeline_id' "$f"; done | jq -sc '.')
+
+          MWAA_HOST="$MWAA_HOST" MWAA_TOKEN="$TOKEN" DB_URL="$DB_URL" \
+            PIPELINE_IDS="$PIPELINE_IDS" python3 scripts/sync_mwaa_runs.py
 
   # ── 7. Record image tag in SSM for promotion ─────────────────────────────────
   record-image-tag:

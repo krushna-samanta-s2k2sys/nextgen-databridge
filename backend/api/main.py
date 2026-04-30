@@ -244,14 +244,30 @@ class QueryRequest(BaseModel):
 # ─────────────────────────────────────────────────────────────────────────────
 # Airflow client helper
 # ─────────────────────────────────────────────────────────────────────────────
+def _mwaa_bearer_token() -> Optional[str]:
+    """Get a short-lived Bearer token from MWAA for the REST API."""
+    env_name = os.getenv("MWAA_ENV_NAME", "nextgen-databridge")
+    region   = os.getenv("AWS_DEFAULT_REGION", "us-east-1")
+    try:
+        import boto3
+        client = boto3.client("mwaa", region_name=region)
+        return client.create_web_login_token(Name=env_name)["WebToken"]
+    except Exception as exc:
+        logger.warning(f"MWAA token fetch failed: {exc}")
+        return None
+
+
 async def airflow_request(method: str, path: str, **kwargs) -> dict:
+    url = f"{AIRFLOW_URL}/api/v1{path}"
     async with httpx.AsyncClient(timeout=30) as client:
-        url = f"{AIRFLOW_URL}/api/v1{path}"
-        resp = await client.request(
-            method, url,
-            auth=(AIRFLOW_USER, AIRFLOW_PASS),
-            **kwargs
-        )
+        if ".airflow.amazonaws.com" in AIRFLOW_URL:
+            token = _mwaa_bearer_token()
+            if not token:
+                raise RuntimeError("Could not obtain MWAA web token")
+            headers = {**kwargs.pop("headers", {}), "Authorization": f"Bearer {token}"}
+            resp = await client.request(method, url, headers=headers, **kwargs)
+        else:
+            resp = await client.request(method, url, auth=(AIRFLOW_USER, AIRFLOW_PASS), **kwargs)
         if resp.status_code >= 400:
             logger.warning(f"Airflow API {method} {path} → {resp.status_code}: {resp.text[:200]}")
         return resp.json() if resp.text else {}

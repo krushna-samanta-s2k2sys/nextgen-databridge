@@ -241,6 +241,11 @@ resource "aws_iam_role_policy" "task_runner" {
         Action   = ["secretsmanager:GetSecretValue"]
         Resource = "arn:aws:secretsmanager:${var.aws_region}:${data.aws_caller_identity.current.account_id}:secret:nextgen-databridge/*"
       },
+      {
+        Effect   = "Allow"
+        Action   = ["airflow:CreateWebLoginToken"]
+        Resource = "arn:aws:airflow:${var.aws_region}:${data.aws_caller_identity.current.account_id}:environment/nextgen-databridge"
+      },
     ]
   })
 }
