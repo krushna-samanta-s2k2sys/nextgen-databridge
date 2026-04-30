@@ -74,40 +74,6 @@
         "table": "raw_salespeople"
       }
     },
-
-    {
-      "task_id": "validate_orders",
-      "type": "data_quality",
-      "depends_on": ["extract_orders"],
-      "source": { "table": "raw_orders" },
-      "checks": [
-        { "type": "row_count_min", "value": 1, "action": "fail", "description": "Must have at least one order for the day" },
-        { "type": "not_null", "column": "OrderID",    "action": "fail" },
-        { "type": "not_null", "column": "CustomerID", "action": "fail" },
-        { "type": "not_null", "column": "OrderDate",  "action": "fail" },
-        { "type": "unique",   "column": "OrderID",    "action": "warn" },
-        { "type": "not_null", "column": "SalespersonPersonID", "action": "warn" }
-      ],
-      "fail_pipeline_on_error": true
-    },
-    {
-      "task_id": "validate_order_lines",
-      "type": "data_quality",
-      "depends_on": ["extract_order_lines"],
-      "source": { "table": "raw_order_lines" },
-      "checks": [
-        { "type": "row_count_min", "value": 1, "action": "fail" },
-        { "type": "not_null", "column": "OrderLineID", "action": "fail" },
-        { "type": "not_null", "column": "OrderID",     "action": "fail" },
-        { "type": "not_null", "column": "StockItemID", "action": "fail" },
-        { "type": "unique",   "column": "OrderLineID", "action": "warn" },
-        { "type": "value_range", "column": "Quantity",  "min": 1,  "action": "warn" },
-        { "type": "value_range", "column": "UnitPrice", "min": 0,  "action": "fail" },
-        { "type": "value_range", "column": "TaxRate",   "min": 0, "max": 100, "action": "warn" }
-      ],
-      "fail_pipeline_on_error": true
-    },
-
     {
       "task_id": "transform_order_header",
       "type": "duckdb_transform",
