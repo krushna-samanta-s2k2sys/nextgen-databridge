@@ -127,7 +127,8 @@ def wait_for_restore(timeout_secs=1800, poll_secs=20):
         with connect() as conn:
             with conn.cursor() as cur:
                 cur.execute("""
-                    SELECT TOP 1 lifecycle, task_type, error_details
+                    SELECT TOP 1 lifecycle, task_type, task_info,
+                                 [% complete] AS pct_complete
                     FROM   msdb.dbo.rds_fn_task_status(NULL, 0)
                     WHERE  task_type = 'RESTORE_DB'
                     ORDER  BY created_at DESC
@@ -138,13 +139,14 @@ def wait_for_restore(timeout_secs=1800, poll_secs=20):
             log.info("  No restore task found yet — waiting …")
         else:
             status = row["lifecycle"]
-            log.info(f"  Restore status: {status}")
+            pct    = row.get("pct_complete") or 0
+            log.info(f"  Restore status: {status} ({pct:.1f}% complete)")
             if status == "SUCCESS":
                 log.info("WideWorldImporters restore SUCCESS.")
                 return
             if status == "ERROR":
                 raise RuntimeError(
-                    f"WideWorldImporters restore FAILED: {row.get('error_details')}"
+                    f"WideWorldImporters restore FAILED: {row.get('task_info')}"
                 )
 
         time.sleep(poll_secs)
