@@ -266,6 +266,11 @@ export function RunDetail() {
                     <span className="text-xs text-gray-400 bg-gray-100 border border-gray-200 px-1.5 py-0.5 rounded">
                       {t.task_type?.replace(/_/g, ' ')}
                     </span>
+                    {t.eks_job_name && (
+                      <span className="text-xs text-violet-600 bg-violet-50 border border-violet-200 px-1.5 py-0.5 rounded font-mono">
+                        eks
+                      </span>
+                    )}
                     <StatusBadge status={t.status} />
                     {t.attempt_number > 1 && (
                       <span className="text-xs text-amber-600 bg-amber-50 border border-amber-200 px-1.5 py-0.5 rounded">
