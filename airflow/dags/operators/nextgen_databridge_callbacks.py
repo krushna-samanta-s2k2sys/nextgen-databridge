@@ -57,6 +57,66 @@ def _write_alert(
         logger.error(f"Failed to write alert: {e}")
 
 
+def _upsert_pipeline_run(
+    pipeline_id: str,
+    run_id: str,
+    status: str,
+    trigger_type: str = "scheduled",
+    triggered_by: Optional[str] = None,
+    start_time: Optional[datetime] = None,
+    end_time: Optional[datetime] = None,
+    duration_seconds: Optional[float] = None,
+    total_tasks: int = 0,
+    completed_tasks: int = 0,
+    failed_tasks: int = 0,
+    error_message: Optional[str] = None,
+):
+    try:
+        conn = _audit_db_conn()
+        cur  = conn.cursor()
+        cur.execute("""
+            INSERT INTO pipeline_runs
+                (id, run_id, pipeline_id, status, trigger_type, triggered_by,
+                 start_time, end_time, duration_seconds,
+                 total_tasks, completed_tasks, failed_tasks, error_message)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (run_id) DO UPDATE SET
+                status           = EXCLUDED.status,
+                end_time         = COALESCE(EXCLUDED.end_time, pipeline_runs.end_time),
+                duration_seconds = COALESCE(EXCLUDED.duration_seconds, pipeline_runs.duration_seconds),
+                total_tasks      = GREATEST(EXCLUDED.total_tasks, pipeline_runs.total_tasks),
+                completed_tasks  = EXCLUDED.completed_tasks,
+                failed_tasks     = EXCLUDED.failed_tasks,
+                error_message    = COALESCE(EXCLUDED.error_message, pipeline_runs.error_message)
+        """, (
+            str(uuid.uuid4()), run_id, pipeline_id, status, trigger_type, triggered_by,
+            start_time, end_time, duration_seconds,
+            total_tasks, completed_tasks, failed_tasks, error_message,
+        ))
+        conn.commit()
+        cur.close()
+        conn.close()
+    except Exception as e:
+        logger.error(f"Failed to upsert pipeline run {run_id}: {e}")
+
+
+def _ensure_run_started(dag_id: str, run_id: str, start_time: Optional[datetime] = None, trigger_type: str = "scheduled"):
+    """Insert a 'running' pipeline_runs row if one doesn't exist yet. No-op on conflict."""
+    try:
+        conn = _audit_db_conn()
+        cur  = conn.cursor()
+        cur.execute("""
+            INSERT INTO pipeline_runs (id, run_id, pipeline_id, status, trigger_type, start_time)
+            VALUES (%s, %s, %s, 'running', %s, %s)
+            ON CONFLICT (run_id) DO NOTHING
+        """, (str(uuid.uuid4()), run_id, dag_id, trigger_type, start_time or datetime.now(timezone.utc)))
+        conn.commit()
+        cur.close()
+        conn.close()
+    except Exception as e:
+        logger.error(f"Failed to ensure pipeline run started {run_id}: {e}")
+
+
 def _write_audit_log(event_type: str, pipeline_id: str, run_id: str, task_id: str, details: dict, severity: str):
     try:
         conn = _audit_db_conn()
@@ -171,6 +231,8 @@ def on_failure_callback(context: dict):
 
     logger.error(f"Task FAILED: {dag_id}/{task_id} — {err_msg[:200]}")
 
+    _ensure_run_started(dag_id, run_id, start_time=ti.start_date if ti else None)
+
     _write_audit_log(
         "TASK_FAILED", dag_id, run_id, task_id,
         {"error": err_msg[:2000], "attempt": ti.try_number if ti else 1},
@@ -206,6 +268,7 @@ def on_success_callback(context: dict):
     duration= ti.duration if ti else 0
 
     logger.info(f"Task SUCCESS: {dag_id}/{task_id} in {duration:.1f}s")
+    _ensure_run_started(dag_id, run_id, start_time=ti.start_date if ti else None)
     _write_audit_log(
         "TASK_COMPLETED", dag_id, run_id, task_id,
         {"duration_seconds": duration},
@@ -227,6 +290,90 @@ def on_retry_callback(context: dict):
         {"attempt": attempt},
         severity="warning",
     )
+
+
+def dag_run_success_callback(context: dict):
+    """Called by Airflow when a full DAG run completes successfully"""
+    dag     = context.get("dag")
+    dag_run = context.get("dag_run")
+    if not dag or not dag_run:
+        return
+
+    dag_id = dag.dag_id
+    run_id = dag_run.run_id
+
+    try:
+        tis       = dag_run.get_task_instances()
+        total     = len(tis)
+        completed = sum(1 for ti in tis if getattr(ti, "state", "") == "success")
+        failed    = sum(1 for ti in tis if getattr(ti, "state", "") in ("failed", "upstream_failed"))
+    except Exception:
+        total = completed = failed = 0
+
+    start = dag_run.start_date
+    end   = dag_run.end_date or datetime.now(timezone.utc)
+    dur   = (end - start).total_seconds() if start and end else None
+
+    run_type = getattr(dag_run, "run_type", None)
+    trigger_type = "manual" if run_type and "manual" in str(run_type).lower() else "scheduled"
+
+    _upsert_pipeline_run(
+        pipeline_id=dag_id,
+        run_id=run_id,
+        status="success",
+        trigger_type=trigger_type,
+        start_time=start,
+        end_time=end,
+        duration_seconds=dur,
+        total_tasks=total,
+        completed_tasks=completed,
+        failed_tasks=failed,
+    )
+    _write_audit_log("RUN_COMPLETED", dag_id, run_id, "_dag",
+                     {"duration_seconds": dur, "total_tasks": total}, severity="info")
+
+
+def dag_run_failure_callback(context: dict):
+    """Called by Airflow when a DAG run fails"""
+    dag     = context.get("dag")
+    dag_run = context.get("dag_run")
+    if not dag or not dag_run:
+        return
+
+    dag_id  = dag.dag_id
+    run_id  = dag_run.run_id
+    reason  = str(context.get("reason", ""))
+
+    try:
+        tis       = dag_run.get_task_instances()
+        total     = len(tis)
+        failed    = sum(1 for ti in tis if getattr(ti, "state", "") in ("failed", "upstream_failed"))
+        completed = sum(1 for ti in tis if getattr(ti, "state", "") == "success")
+    except Exception:
+        total = completed = failed = 0
+
+    start = dag_run.start_date
+    end   = dag_run.end_date or datetime.now(timezone.utc)
+    dur   = (end - start).total_seconds() if start and end else None
+
+    run_type = getattr(dag_run, "run_type", None)
+    trigger_type = "manual" if run_type and "manual" in str(run_type).lower() else "scheduled"
+
+    _upsert_pipeline_run(
+        pipeline_id=dag_id,
+        run_id=run_id,
+        status="failed",
+        trigger_type=trigger_type,
+        start_time=start,
+        end_time=end,
+        duration_seconds=dur,
+        total_tasks=total,
+        completed_tasks=completed,
+        failed_tasks=failed,
+        error_message=reason[:2000] if reason else None,
+    )
+    _write_audit_log("RUN_FAILED", dag_id, run_id, "_dag",
+                     {"duration_seconds": dur, "reason": reason[:500]}, severity="error")
 
 
 def sla_miss_callback(dag, task_list, blocking_task_list, slas, blocking_tis):

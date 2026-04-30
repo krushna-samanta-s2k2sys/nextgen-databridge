@@ -45,6 +45,8 @@ from operators.nextgen_databridge_callbacks import (
     on_failure_callback,
     on_retry_callback,
     sla_miss_callback,
+    dag_run_success_callback,
+    dag_run_failure_callback,
 )
 from operators.config_loader import load_active_pipeline_configs
 
@@ -228,6 +230,8 @@ def build_dag(pipeline_config: dict) -> DAG:
         max_active_runs=max_runs,
         tags=["nextgen-databridge"] + tags,
         sla_miss_callback=sla_miss_callback,
+        on_success_callback=dag_run_success_callback,
+        on_failure_callback=dag_run_failure_callback,
         dagrun_timeout=timedelta(minutes=pipeline_config.get("dag_timeout_minutes", 480)),
         doc_md=f"""
 ## Pipeline: {pid}
