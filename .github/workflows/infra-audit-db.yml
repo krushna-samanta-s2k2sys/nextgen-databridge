@@ -167,10 +167,33 @@ jobs:
         working-directory: infra/terraform/audit-db
         run: terraform apply -auto-approve tfplan-audit-db.bin
 
-      # After apply, create all audit tables, enums, and indexes
+      # After apply, create all audit tables, enums, and indexes.
+      # The RDS SG only allows VPC CIDR by default, so we temporarily open port 5432
+      # to the runner IP and clean up with a trap regardless of success/failure.
       - name: Create audit schema
         if: inputs.action == 'apply'
         run: |
+          set -euo pipefail
+
+          RUNNER_IP=$(curl -sf https://checkip.amazonaws.com)
+          RUNNER_CIDR="${RUNNER_IP}/32"
+
+          SG_ID=$(aws ec2 describe-security-groups \
+            --filters "Name=group-name,Values=nextgen-databridge-postgres" \
+            --query 'SecurityGroups[0].GroupId' --output text)
+
+          cleanup() {
+            aws ec2 revoke-security-group-ingress \
+              --group-id "$SG_ID" \
+              --protocol tcp --port 5432 --cidr "$RUNNER_CIDR" 2>/dev/null || true
+          }
+          trap cleanup EXIT
+
+          aws ec2 authorize-security-group-ingress \
+            --group-id "$SG_ID" \
+            --protocol tcp --port 5432 --cidr "$RUNNER_CIDR" \
+            --tag-specifications "ResourceType=security-group-rule,Tags=[{Key=ci-runner,Value=true}]"
+
           pip install --quiet sqlalchemy psycopg2-binary
           DB_SECRET=$(aws secretsmanager get-secret-value \
             --secret-id "nextgen-databridge/connections/audit_db" \

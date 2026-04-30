@@ -15,8 +15,3 @@ variable "db_password" {
   description = "Password for the PostgreSQL audit database (user: airflow). Min 8 chars."
 }
 
-variable "developer_cidr_blocks" {
-  type        = list(string)
-  default     = []
-  description = "Additional CIDR blocks allowed direct PostgreSQL access (e.g. dev machine IPs)."
-}

@@ -51,21 +51,11 @@ resource "aws_security_group" "postgres" {
   vpc_id = data.aws_vpc.main.id
 
   ingress {
-    description = "PostgreSQL"
+    description = "PostgreSQL from VPC"
     from_port   = 5432
     to_port     = 5432
     protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-  dynamic "ingress" {
-    for_each = length(var.developer_cidr_blocks) > 0 ? [1] : []
-    content {
-      description = "PostgreSQL from developer machines"
-      from_port   = 5432
-      to_port     = 5432
-      protocol    = "tcp"
-      cidr_blocks = var.developer_cidr_blocks
-    }
+    cidr_blocks = [data.aws_vpc.main.cidr_block]
   }
   egress {
     from_port   = 0

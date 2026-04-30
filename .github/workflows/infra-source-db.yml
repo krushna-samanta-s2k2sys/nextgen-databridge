@@ -168,10 +168,33 @@ jobs:
         working-directory: infra/terraform/wwi
         run: terraform apply -auto-approve tfplan-wwi.bin
 
-      # After apply, restore WideWorldImporters and create TargetDB tables
+      # After apply, restore WideWorldImporters and create TargetDB tables.
+      # The RDS SG only allows VPC CIDR by default, so we temporarily open port 1433
+      # to the runner IP and clean up with a trap regardless of success/failure.
       - name: Restore WideWorldImporters and create TargetDB
         if: inputs.action == 'apply'
         run: |
+          set -euo pipefail
+
+          RUNNER_IP=$(curl -sf https://checkip.amazonaws.com)
+          RUNNER_CIDR="${RUNNER_IP}/32"
+
+          SG_ID=$(aws ec2 describe-security-groups \
+            --filters "Name=group-name,Values=nextgen-databridge-sqlserver" \
+            --query 'SecurityGroups[0].GroupId' --output text)
+
+          cleanup() {
+            aws ec2 revoke-security-group-ingress \
+              --group-id "$SG_ID" \
+              --protocol tcp --port 1433 --cidr "$RUNNER_CIDR" 2>/dev/null || true
+          }
+          trap cleanup EXIT
+
+          aws ec2 authorize-security-group-ingress \
+            --group-id "$SG_ID" \
+            --protocol tcp --port 1433 --cidr "$RUNNER_CIDR" \
+            --tag-specifications "ResourceType=security-group-rule,Tags=[{Key=ci-runner,Value=true}]"
+
           pip install --quiet pymssql boto3
           SQLSERVER_HOST=$(cd infra/terraform/wwi && terraform output -raw sqlserver_endpoint)
           ACCOUNT=$(aws sts get-caller-identity --query Account --output text)

@@ -1,0 +1,251 @@
+name: Developer Access Toggle
+
+# Temporarily opens or closes direct developer access to databases and services.
+#
+# - postgres / sqlserver: adds or revokes an IP rule on the RDS security group
+# - web-api:              NLBs are always internet-facing; this just outputs the URLs
+#
+# For enable:  provide your public IP in the cidr input (e.g. 203.0.113.1/32).
+#              If left blank the workflow auto-detects the runner's egress IP —
+#              useful only if you are running a self-hosted runner on your laptop.
+# For disable: provide the same cidr you used when enabling, OR leave blank to
+#              revoke ALL non-VPC rules from the selected security groups.
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "Enable or disable developer access"
+        required: true
+        type: choice
+        options: [enable, disable]
+      environment:
+        description: "Target environment"
+        required: true
+        type: choice
+        options: [dev, staging, production]
+      resources:
+        description: "Resources to toggle"
+        required: true
+        type: choice
+        options: [all, postgres, sqlserver, web-api]
+      cidr:
+        description: "Your IP/CIDR (e.g. 203.0.113.1/32). Leave blank to auto-detect for enable, or to revoke all non-VPC rules for disable."
+        required: false
+        default: ""
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  PRIMARY_REGION: us-east-1
+  ROLE_ARN_DEV:        arn:aws:iam::877707676590:role/nextgen-databridge-github-actions-dev
+  ROLE_ARN_STAGING:    arn:aws:iam::STAGING_ACCOUNT_ID:role/nextgen-databridge-github-actions-staging
+  ROLE_ARN_PROD:       arn:aws:iam::PROD_ACCOUNT_ID:role/nextgen-databridge-github-actions-production
+
+jobs:
+  toggle:
+    name: "${{ inputs.action }} ${{ inputs.resources }} — ${{ inputs.environment }}"
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    steps:
+      - name: Resolve role
+        id: cfg
+        run: |
+          case "${{ inputs.environment }}" in
+            dev)        ROLE="${{ env.ROLE_ARN_DEV }}" ;;
+            staging)    ROLE="${{ env.ROLE_ARN_STAGING }}" ;;
+            production) ROLE="${{ env.ROLE_ARN_PROD }}" ;;
+          esac
+          echo "role_arn=${ROLE}" >> "$GITHUB_OUTPUT"
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ steps.cfg.outputs.role_arn }}
+          aws-region: ${{ env.PRIMARY_REGION }}
+
+      # ─── Resolve CIDR ──────────────────────────────────────────────────────
+      - name: Resolve CIDR
+        id: cidr
+        if: inputs.resources != 'web-api'
+        run: |
+          CIDR="${{ inputs.cidr }}"
+          if [[ -z "$CIDR" && "${{ inputs.action }}" == "enable" ]]; then
+            MY_IP=$(curl -sf https://checkip.amazonaws.com)
+            CIDR="${MY_IP}/32"
+            echo "Auto-detected IP: ${CIDR}"
+          fi
+          echo "value=${CIDR}" >> "$GITHUB_OUTPUT"
+
+      # ─── PostgreSQL ─────────────────────────────────────────────────────────
+      - name: Toggle PostgreSQL access
+        if: inputs.resources == 'postgres' || inputs.resources == 'all'
+        run: |
+          SG_ID=$(aws ec2 describe-security-groups \
+            --filters "Name=group-name,Values=nextgen-databridge-postgres" \
+            --query 'SecurityGroups[0].GroupId' --output text)
+
+          if [[ -z "$SG_ID" || "$SG_ID" == "None" ]]; then
+            echo "Security group nextgen-databridge-postgres not found — skipping."
+            exit 0
+          fi
+          echo "PostgreSQL SG: ${SG_ID}"
+
+          if [[ "${{ inputs.action }}" == "enable" ]]; then
+            CIDR="${{ steps.cidr.outputs.value }}"
+            # Authorize (ignore error if rule already exists)
+            aws ec2 authorize-security-group-ingress \
+              --group-id "$SG_ID" \
+              --protocol tcp --port 5432 --cidr "$CIDR" \
+              --tag-specifications "ResourceType=security-group-rule,Tags=[{Key=developer-access,Value=true},{Key=added-by,Value=${{ github.actor }}},{Key=environment,Value=${{ inputs.environment }}}]" \
+              2>&1 | grep -v "InvalidPermission.Duplicate" || true
+            echo "✓ PostgreSQL access opened for ${CIDR}"
+            {
+              echo "### PostgreSQL Access Enabled"
+              echo "| Field | Value |"
+              echo "|---|---|"
+              echo "| CIDR | \`${CIDR}\` |"
+              echo "| Host | See Secrets Manager: \`nextgen-databridge/connections/audit_db\` → host field |"
+              echo "| Port | \`5432\` |"
+              echo "| User | \`airflow\` |"
+              echo "| Database | \`airflow\` |"
+            } >> "$GITHUB_STEP_SUMMARY"
+
+          else
+            CIDR="${{ steps.cidr.outputs.value }}"
+            if [[ -n "$CIDR" ]]; then
+              aws ec2 revoke-security-group-ingress \
+                --group-id "$SG_ID" \
+                --protocol tcp --port 5432 --cidr "$CIDR" || true
+              echo "✓ Revoked PostgreSQL access for ${CIDR}"
+            else
+              # Revoke all non-VPC rules on port 5432
+              VPC_CIDR=$(aws ec2 describe-vpcs \
+                --filters "Name=tag:Name,Values=nextgen-databridge-vpc" \
+                --query 'Vpcs[0].CidrBlock' --output text)
+              aws ec2 describe-security-groups --group-ids "$SG_ID" \
+                --query 'SecurityGroups[0].IpPermissions[?FromPort==`5432`].IpRanges[].CidrIp' \
+                --output text | tr '\t' '\n' | while read -r RULE_CIDR; do
+                  if [[ "$RULE_CIDR" != "$VPC_CIDR" && -n "$RULE_CIDR" ]]; then
+                    aws ec2 revoke-security-group-ingress \
+                      --group-id "$SG_ID" \
+                      --protocol tcp --port 5432 --cidr "$RULE_CIDR" || true
+                    echo "Revoked: ${RULE_CIDR}"
+                  fi
+                done
+              echo "✓ All non-VPC PostgreSQL access revoked"
+            fi
+          fi
+
+      # ─── SQL Server ─────────────────────────────────────────────────────────
+      - name: Toggle SQL Server access
+        if: inputs.resources == 'sqlserver' || inputs.resources == 'all'
+        run: |
+          SG_ID=$(aws ec2 describe-security-groups \
+            --filters "Name=group-name,Values=nextgen-databridge-sqlserver" \
+            --query 'SecurityGroups[0].GroupId' --output text)
+
+          if [[ -z "$SG_ID" || "$SG_ID" == "None" ]]; then
+            echo "Security group nextgen-databridge-sqlserver not found — skipping."
+            exit 0
+          fi
+          echo "SQL Server SG: ${SG_ID}"
+
+          if [[ "${{ inputs.action }}" == "enable" ]]; then
+            CIDR="${{ steps.cidr.outputs.value }}"
+            aws ec2 authorize-security-group-ingress \
+              --group-id "$SG_ID" \
+              --protocol tcp --port 1433 --cidr "$CIDR" \
+              --tag-specifications "ResourceType=security-group-rule,Tags=[{Key=developer-access,Value=true},{Key=added-by,Value=${{ github.actor }}},{Key=environment,Value=${{ inputs.environment }}}]" \
+              2>&1 | grep -v "InvalidPermission.Duplicate" || true
+            echo "✓ SQL Server access opened for ${CIDR}"
+
+            # Retrieve the endpoint from Secrets Manager for the summary
+            SECRET=$(aws secretsmanager get-secret-value \
+              --secret-id "nextgen-databridge/connections/wwi_sqlserver" \
+              --query SecretString --output text 2>/dev/null || echo "{}")
+            HOST=$(echo "$SECRET" | python3 -c "import json,sys; d=json.loads(sys.stdin.read()); print(d.get('host','<run terraform output sqlserver_endpoint>'))" 2>/dev/null || echo "<check Secrets Manager>")
+            {
+              echo "### SQL Server Access Enabled"
+              echo "| Field | Value |"
+              echo "|---|---|"
+              echo "| CIDR | \`${CIDR}\` |"
+              echo "| Host | \`${HOST}\` |"
+              echo "| Port | \`1433\` |"
+              echo "| User | \`sqladmin\` |"
+              echo "| Source DB | \`WideWorldImporters\` |"
+              echo "| Target DB | \`TargetDB\` |"
+            } >> "$GITHUB_STEP_SUMMARY"
+
+          else
+            CIDR="${{ steps.cidr.outputs.value }}"
+            if [[ -n "$CIDR" ]]; then
+              aws ec2 revoke-security-group-ingress \
+                --group-id "$SG_ID" \
+                --protocol tcp --port 1433 --cidr "$CIDR" || true
+              echo "✓ Revoked SQL Server access for ${CIDR}"
+            else
+              VPC_CIDR=$(aws ec2 describe-vpcs \
+                --filters "Name=tag:Name,Values=nextgen-databridge-vpc" \
+                --query 'Vpcs[0].CidrBlock' --output text)
+              aws ec2 describe-security-groups --group-ids "$SG_ID" \
+                --query 'SecurityGroups[0].IpPermissions[?FromPort==`1433`].IpRanges[].CidrIp' \
+                --output text | tr '\t' '\n' | while read -r RULE_CIDR; do
+                  if [[ "$RULE_CIDR" != "$VPC_CIDR" && -n "$RULE_CIDR" ]]; then
+                    aws ec2 revoke-security-group-ingress \
+                      --group-id "$SG_ID" \
+                      --protocol tcp --port 1433 --cidr "$RULE_CIDR" || true
+                    echo "Revoked: ${RULE_CIDR}"
+                  fi
+                done
+              echo "✓ All non-VPC SQL Server access revoked"
+            fi
+          fi
+
+      # ─── Web & API ──────────────────────────────────────────────────────────
+      - name: Get Web & API endpoints
+        if: inputs.resources == 'web-api' || inputs.resources == 'all'
+        run: |
+          CLUSTER="nextgen-databridge"
+          aws eks update-kubeconfig --name "$CLUSTER" --region "${{ env.PRIMARY_REGION }}" 2>/dev/null || {
+            echo "EKS cluster '${CLUSTER}' not reachable — cannot retrieve NLB endpoints."
+            exit 0
+          }
+
+          echo "Fetching LoadBalancer endpoints from namespace nextgen-databridge..."
+          kubectl get svc -n nextgen-databridge \
+            -o jsonpath='{range .items[?(@.spec.type=="LoadBalancer")]}{.metadata.name}{"\t"}{.status.loadBalancer.ingress[0].hostname}{"\n"}{end}' \
+          | while IFS=$'\t' read -r SVC_NAME HOSTNAME; do
+              [[ -z "$HOSTNAME" ]] && HOSTNAME="<pending — NLB not yet provisioned>"
+              echo "${SVC_NAME}: ${HOSTNAME}"
+            done
+
+          {
+            echo "### Web & API Endpoints"
+            echo "> NLBs are always internet-facing. No security group change required."
+            echo ""
+            echo "| Service | URL |"
+            echo "|---|---|"
+            kubectl get svc -n nextgen-databridge \
+              -o jsonpath='{range .items[?(@.spec.type=="LoadBalancer")]}{.metadata.name}{"\t"}{.status.loadBalancer.ingress[0].hostname}{"\n"}{end}' \
+            | while IFS=$'\t' read -r SVC_NAME HOSTNAME; do
+                [[ -z "$HOSTNAME" ]] && HOSTNAME="pending"
+                echo "| \`${SVC_NAME}\` | \`${HOSTNAME}\` |"
+              done
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # ─── Final summary ──────────────────────────────────────────────────────
+      - name: Write summary header
+        if: always()
+        run: |
+          {
+            echo ""
+            echo "---"
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Action | \`${{ inputs.action }}\` |"
+            echo "| Environment | \`${{ inputs.environment }}\` |"
+            echo "| Resources | \`${{ inputs.resources }}\` |"
+            echo "| Actor | @${{ github.actor }} |"
+          } >> "$GITHUB_STEP_SUMMARY"

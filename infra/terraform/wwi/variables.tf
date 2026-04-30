@@ -20,8 +20,3 @@ variable "sqlserver_version" {
   description = "RDS SQL Server engine version. 15.00.x = SQL Server 2019 SE."
 }
 
-variable "developer_cidr_blocks" {
-  type        = list(string)
-  default     = []
-  description = "Additional CIDR blocks allowed direct SQL Server access."
-}

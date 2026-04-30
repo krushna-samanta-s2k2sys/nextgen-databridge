@@ -105,11 +105,11 @@ resource "aws_security_group" "sqlserver" {
   vpc_id = data.aws_vpc.main.id
 
   ingress {
-    description = "SQL Server open access"
+    description = "SQL Server from VPC"
     from_port   = 1433
     to_port     = 1433
     protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
+    cidr_blocks = [data.aws_vpc.main.cidr_block]
   }
   egress {
     from_port   = 0
