@@ -491,25 +491,47 @@ async def update_pipeline(
         new_version = req.config.get("version", pipeline.current_version or "1.0.0")
         pipeline.current_version = new_version
 
-        # Deactivate old config
-        await db.execute(
-            update(PipelineConfig)
-            .where(PipelineConfig.pipeline_id == pipeline_id)
-            .values(is_active=False)
+        # Check whether this version already exists (re-deploy idempotency)
+        existing_result = await db.execute(
+            select(PipelineConfig).where(
+                PipelineConfig.pipeline_id == pipeline_id,
+                PipelineConfig.version == new_version,
+            )
         )
+        existing_config = existing_result.scalar_one_or_none()
 
-        # Add new config
-        config_entry = PipelineConfig(
-            id=str(uuid.uuid4()),
-            pipeline_id=pipeline_id,
-            version=new_version,
-            config=req.config,
-            is_active=True,
-            is_valid=vresult.valid,
-            validation_errors=vresult.to_dict() if not vresult.valid else None,
-            created_by=user,
-        )
-        db.add(config_entry)
+        if existing_config:
+            # Same version — update in place, deactivate other versions
+            existing_config.config = req.config
+            existing_config.is_active = True
+            existing_config.is_valid = vresult.valid
+            existing_config.validation_errors = vresult.to_dict() if not vresult.valid else None
+            await db.execute(
+                update(PipelineConfig)
+                .where(
+                    PipelineConfig.pipeline_id == pipeline_id,
+                    PipelineConfig.version != new_version,
+                )
+                .values(is_active=False)
+            )
+        else:
+            # New version — deactivate old, insert new
+            await db.execute(
+                update(PipelineConfig)
+                .where(PipelineConfig.pipeline_id == pipeline_id)
+                .values(is_active=False)
+            )
+            config_entry = PipelineConfig(
+                id=str(uuid.uuid4()),
+                pipeline_id=pipeline_id,
+                version=new_version,
+                config=req.config,
+                is_active=True,
+                is_valid=vresult.valid,
+                validation_errors=vresult.to_dict() if not vresult.valid else None,
+                created_by=user,
+            )
+            db.add(config_entry)
 
         background_tasks.add_task(
             audit.config_updated, pipeline_id, old_version or "", new_version, user
