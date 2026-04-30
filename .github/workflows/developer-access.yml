@@ -6,8 +6,7 @@ name: Developer Access Toggle
 # - web-api:              NLBs are always internet-facing; this just outputs the URLs
 #
 # For enable:  provide your public IP in the cidr input (e.g. 203.0.113.1/32).
-#              If left blank the workflow auto-detects the runner's egress IP —
-#              useful only if you are running a self-hosted runner on your laptop.
+#              Leave blank ONLY when running on a self-hosted runner on your laptop.
 # For disable: provide the same cidr you used when enabling, OR leave blank to
 #              revoke ALL non-VPC rules from the selected security groups.
 
@@ -30,7 +29,7 @@ on:
         type: choice
         options: [all, postgres, sqlserver, web-api]
       cidr:
-        description: "Your IP/CIDR (e.g. 203.0.113.1/32). Leave blank to auto-detect for enable, or to revoke all non-VPC rules for disable."
+        description: "Your public IP/CIDR (e.g. 203.0.113.1/32). Find yours at https://checkip.amazonaws.com"
         required: false
         default: ""
 
@@ -71,45 +70,121 @@ jobs:
         if: inputs.resources != 'web-api'
         run: |
           CIDR="${{ inputs.cidr }}"
+          AUTO_DETECTED=false
+
           if [[ -z "$CIDR" && "${{ inputs.action }}" == "enable" ]]; then
+            # ⚠️  This detects the GitHub Actions RUNNER IP, not your local machine.
+            # On GitHub-hosted runners the rule is added for an ephemeral Azure IP
+            # that will NOT match your laptop. Re-run with your IP in the cidr input.
             MY_IP=$(curl -sf https://checkip.amazonaws.com)
             CIDR="${MY_IP}/32"
-            echo "Auto-detected IP: ${CIDR}"
+            AUTO_DETECTED=true
+            echo "::warning::CIDR not provided — auto-detected runner IP ${CIDR}. On a GitHub-hosted runner this is NOT your local IP. Re-run with your public IP in the 'cidr' input (https://checkip.amazonaws.com)."
+            echo "Auto-detected runner IP: ${CIDR}"
           fi
-          echo "value=${CIDR}" >> "$GITHUB_OUTPUT"
+
+          # Validate CIDR format
+          if [[ "${{ inputs.action }}" == "enable" && -n "$CIDR" ]]; then
+            if ! echo "$CIDR" | grep -qE '^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}$'; then
+              echo "::error::CIDR '${CIDR}' is not valid. Use format X.X.X.X/32 (e.g. 203.0.113.5/32)."
+              exit 1
+            fi
+          fi
+
+          echo "value=${CIDR}"                 >> "$GITHUB_OUTPUT"
+          echo "auto_detected=${AUTO_DETECTED}" >> "$GITHUB_OUTPUT"
+
+      # ─── Resolve VPC (scoped to the target environment) ────────────────────
+      # SG names are only unique within a VPC. Without a VPC filter the
+      # describe-security-groups call can return an SG from a different
+      # environment (e.g. staging) when multiple envs share the same account.
+      - name: Resolve VPC
+        id: vpc
+        if: inputs.resources != 'web-api'
+        run: |
+          VPC_ID=$(aws ec2 describe-vpcs \
+            --filters \
+              "Name=tag:Name,Values=nextgen-databridge-vpc" \
+              "Name=tag:Environment,Values=${{ inputs.environment }}" \
+            --query 'Vpcs[0].VpcId' --output text)
+
+          if [[ -z "$VPC_ID" || "$VPC_ID" == "None" ]]; then
+            echo "::error::VPC 'nextgen-databridge-vpc' not found for environment '${{ inputs.environment }}'. Has infra-core been applied?"
+            exit 1
+          fi
+
+          VPC_CIDR=$(aws ec2 describe-vpcs \
+            --vpc-ids "$VPC_ID" \
+            --query 'Vpcs[0].CidrBlock' --output text)
+
+          echo "VPC ID:   ${VPC_ID}"
+          echo "VPC CIDR: ${VPC_CIDR}"
+          echo "vpc_id=${VPC_ID}"     >> "$GITHUB_OUTPUT"
+          echo "vpc_cidr=${VPC_CIDR}" >> "$GITHUB_OUTPUT"
+
+      # ─── Helper: lookup SG scoped to the environment's VPC ─────────────────
+      # Used by both PostgreSQL and SQL Server steps below via $SG_* variables.
 
       # ─── PostgreSQL ─────────────────────────────────────────────────────────
       - name: Toggle PostgreSQL access
         if: inputs.resources == 'postgres' || inputs.resources == 'all'
         run: |
+          set -euo pipefail
+
           SG_ID=$(aws ec2 describe-security-groups \
-            --filters "Name=group-name,Values=nextgen-databridge-postgres" \
+            --filters \
+              "Name=group-name,Values=nextgen-databridge-postgres" \
+              "Name=vpc-id,Values=${{ steps.vpc.outputs.vpc_id }}" \
             --query 'SecurityGroups[0].GroupId' --output text)
 
           if [[ -z "$SG_ID" || "$SG_ID" == "None" ]]; then
-            echo "Security group nextgen-databridge-postgres not found — skipping."
+            echo "Security group nextgen-databridge-postgres not found in VPC ${{ steps.vpc.outputs.vpc_id }} — skipping."
             exit 0
           fi
           echo "PostgreSQL SG: ${SG_ID}"
 
           if [[ "${{ inputs.action }}" == "enable" ]]; then
             CIDR="${{ steps.cidr.outputs.value }}"
-            # Authorize (ignore error if rule already exists)
-            aws ec2 authorize-security-group-ingress \
+
+            # Authorize — fail on any real error, only ignore exact duplicate
+            ERR_OUT=$(aws ec2 authorize-security-group-ingress \
               --group-id "$SG_ID" \
               --protocol tcp --port 5432 --cidr "$CIDR" \
               --tag-specifications "ResourceType=security-group-rule,Tags=[{Key=developer-access,Value=true},{Key=added-by,Value=${{ github.actor }}},{Key=environment,Value=${{ inputs.environment }}}]" \
-              2>&1 | grep -v "InvalidPermission.Duplicate" || true
-            echo "✓ PostgreSQL access opened for ${CIDR}"
+              2>&1) && echo "✓ Rule added." || {
+              if echo "$ERR_OUT" | grep -q "InvalidPermission.Duplicate"; then
+                echo "Rule already exists for ${CIDR} — no change needed."
+              else
+                echo "::error::Failed to add PostgreSQL SG rule: ${ERR_OUT}"
+                exit 1
+              fi
+            }
+            echo "✓ PostgreSQL access enabled for ${CIDR} on SG ${SG_ID}"
+
+            # Fetch host from Secrets Manager
+            PG_SECRET=$(aws secretsmanager get-secret-value \
+              --secret-id "nextgen-databridge/connections/audit_db" \
+              --query SecretString --output text 2>/dev/null || echo "{}")
+            PG_HOST=$(echo "$PG_SECRET" | python3 -c \
+              "import json,sys; d=json.loads(sys.stdin.read()); print(d.get('host','<not found — check Secrets Manager>'))" \
+              2>/dev/null || echo "<check Secrets Manager>")
+
             {
+              if [[ "${{ steps.cidr.outputs.auto_detected }}" == "true" ]]; then
+                echo "> [!WARNING]"
+                echo "> CIDR was **auto-detected as the GitHub runner IP** \`${CIDR}\`. On a GitHub-hosted runner this is **not your laptop**. Re-run with your public IP in the **cidr** input (find it at https://checkip.amazonaws.com)."
+                echo ""
+              fi
               echo "### PostgreSQL Access Enabled"
               echo "| Field | Value |"
               echo "|---|---|"
-              echo "| CIDR | \`${CIDR}\` |"
-              echo "| Host | See Secrets Manager: \`nextgen-databridge/connections/audit_db\` → host field |"
+              echo "| CIDR allowed | \`${CIDR}\` |"
+              echo "| Security Group | \`${SG_ID}\` |"
+              echo "| Host | \`${PG_HOST}\` |"
               echo "| Port | \`5432\` |"
               echo "| User | \`airflow\` |"
               echo "| Database | \`airflow\` |"
+              echo "| Password | Fetch from Secrets Manager: \`nextgen-databridge/connections/audit_db\` → \`password\` |"
             } >> "$GITHUB_STEP_SUMMARY"
 
           else
@@ -117,20 +192,18 @@ jobs:
             if [[ -n "$CIDR" ]]; then
               aws ec2 revoke-security-group-ingress \
                 --group-id "$SG_ID" \
-                --protocol tcp --port 5432 --cidr "$CIDR" || true
+                --protocol tcp --port 5432 --cidr "$CIDR" 2>/dev/null || true
               echo "✓ Revoked PostgreSQL access for ${CIDR}"
             else
               # Revoke all non-VPC rules on port 5432
-              VPC_CIDR=$(aws ec2 describe-vpcs \
-                --filters "Name=tag:Name,Values=nextgen-databridge-vpc" \
-                --query 'Vpcs[0].CidrBlock' --output text)
+              VPC_CIDR="${{ steps.vpc.outputs.vpc_cidr }}"
               aws ec2 describe-security-groups --group-ids "$SG_ID" \
                 --query 'SecurityGroups[0].IpPermissions[?FromPort==`5432`].IpRanges[].CidrIp' \
                 --output text | tr '\t' '\n' | while read -r RULE_CIDR; do
                   if [[ "$RULE_CIDR" != "$VPC_CIDR" && -n "$RULE_CIDR" ]]; then
                     aws ec2 revoke-security-group-ingress \
                       --group-id "$SG_ID" \
-                      --protocol tcp --port 5432 --cidr "$RULE_CIDR" || true
+                      --protocol tcp --port 5432 --cidr "$RULE_CIDR" 2>/dev/null || true
                     echo "Revoked: ${RULE_CIDR}"
                   fi
                 done
@@ -142,40 +215,62 @@ jobs:
       - name: Toggle SQL Server access
         if: inputs.resources == 'sqlserver' || inputs.resources == 'all'
         run: |
+          set -euo pipefail
+
           SG_ID=$(aws ec2 describe-security-groups \
-            --filters "Name=group-name,Values=nextgen-databridge-sqlserver" \
+            --filters \
+              "Name=group-name,Values=nextgen-databridge-sqlserver" \
+              "Name=vpc-id,Values=${{ steps.vpc.outputs.vpc_id }}" \
             --query 'SecurityGroups[0].GroupId' --output text)
 
           if [[ -z "$SG_ID" || "$SG_ID" == "None" ]]; then
-            echo "Security group nextgen-databridge-sqlserver not found — skipping."
+            echo "Security group nextgen-databridge-sqlserver not found in VPC ${{ steps.vpc.outputs.vpc_id }} — skipping."
             exit 0
           fi
           echo "SQL Server SG: ${SG_ID}"
 
           if [[ "${{ inputs.action }}" == "enable" ]]; then
             CIDR="${{ steps.cidr.outputs.value }}"
-            aws ec2 authorize-security-group-ingress \
+
+            ERR_OUT=$(aws ec2 authorize-security-group-ingress \
               --group-id "$SG_ID" \
               --protocol tcp --port 1433 --cidr "$CIDR" \
               --tag-specifications "ResourceType=security-group-rule,Tags=[{Key=developer-access,Value=true},{Key=added-by,Value=${{ github.actor }}},{Key=environment,Value=${{ inputs.environment }}}]" \
-              2>&1 | grep -v "InvalidPermission.Duplicate" || true
-            echo "✓ SQL Server access opened for ${CIDR}"
+              2>&1) && echo "✓ Rule added." || {
+              if echo "$ERR_OUT" | grep -q "InvalidPermission.Duplicate"; then
+                echo "Rule already exists for ${CIDR} — no change needed."
+              else
+                echo "::error::Failed to add SQL Server SG rule: ${ERR_OUT}"
+                exit 1
+              fi
+            }
+            echo "✓ SQL Server access enabled for ${CIDR} on SG ${SG_ID}"
 
-            # Retrieve the endpoint from Secrets Manager for the summary
+            # Fetch host from Secrets Manager
             SECRET=$(aws secretsmanager get-secret-value \
               --secret-id "nextgen-databridge/connections/wwi_sqlserver" \
               --query SecretString --output text 2>/dev/null || echo "{}")
-            HOST=$(echo "$SECRET" | python3 -c "import json,sys; d=json.loads(sys.stdin.read()); print(d.get('host','<run terraform output sqlserver_endpoint>'))" 2>/dev/null || echo "<check Secrets Manager>")
+            HOST=$(echo "$SECRET" | python3 -c \
+              "import json,sys; d=json.loads(sys.stdin.read()); print(d.get('host','<not found — check Secrets Manager>'))" \
+              2>/dev/null || echo "<check Secrets Manager>")
+
             {
+              if [[ "${{ steps.cidr.outputs.auto_detected }}" == "true" ]]; then
+                echo "> [!WARNING]"
+                echo "> CIDR was **auto-detected as the GitHub runner IP** \`${CIDR}\`. On a GitHub-hosted runner this is **not your laptop**. Re-run with your public IP in the **cidr** input (find it at https://checkip.amazonaws.com)."
+                echo ""
+              fi
               echo "### SQL Server Access Enabled"
               echo "| Field | Value |"
               echo "|---|---|"
-              echo "| CIDR | \`${CIDR}\` |"
+              echo "| CIDR allowed | \`${CIDR}\` |"
+              echo "| Security Group | \`${SG_ID}\` |"
               echo "| Host | \`${HOST}\` |"
               echo "| Port | \`1433\` |"
               echo "| User | \`sqladmin\` |"
               echo "| Source DB | \`WideWorldImporters\` |"
               echo "| Target DB | \`TargetDB\` |"
+              echo "| Password | Fetch from Secrets Manager: \`nextgen-databridge/connections/wwi_sqlserver\` → \`password\` |"
             } >> "$GITHUB_STEP_SUMMARY"
 
           else
@@ -183,19 +278,17 @@ jobs:
             if [[ -n "$CIDR" ]]; then
               aws ec2 revoke-security-group-ingress \
                 --group-id "$SG_ID" \
-                --protocol tcp --port 1433 --cidr "$CIDR" || true
+                --protocol tcp --port 1433 --cidr "$CIDR" 2>/dev/null || true
               echo "✓ Revoked SQL Server access for ${CIDR}"
             else
-              VPC_CIDR=$(aws ec2 describe-vpcs \
-                --filters "Name=tag:Name,Values=nextgen-databridge-vpc" \
-                --query 'Vpcs[0].CidrBlock' --output text)
+              VPC_CIDR="${{ steps.vpc.outputs.vpc_cidr }}"
               aws ec2 describe-security-groups --group-ids "$SG_ID" \
                 --query 'SecurityGroups[0].IpPermissions[?FromPort==`1433`].IpRanges[].CidrIp' \
                 --output text | tr '\t' '\n' | while read -r RULE_CIDR; do
                   if [[ "$RULE_CIDR" != "$VPC_CIDR" && -n "$RULE_CIDR" ]]; then
                     aws ec2 revoke-security-group-ingress \
                       --group-id "$SG_ID" \
-                      --protocol tcp --port 1433 --cidr "$RULE_CIDR" || true
+                      --protocol tcp --port 1433 --cidr "$RULE_CIDR" 2>/dev/null || true
                     echo "Revoked: ${RULE_CIDR}"
                   fi
                 done
@@ -236,7 +329,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       # ─── Final summary ──────────────────────────────────────────────────────
-      - name: Write summary header
+      - name: Write summary footer
         if: always()
         run: |
           {

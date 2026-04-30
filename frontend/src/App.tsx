@@ -13,6 +13,7 @@ import Dashboard from './pages/Dashboard'
 import { ConfiguredPipelines, PipelineConfigDetail } from './pages/ConfiguredPipelines'
 import { Runs, RunDetail } from './pages/Runs'
 import QueryEditor from './pages/QueryEditor'
+import ConfigReference from './pages/ConfigReference'
 
 const qc = new QueryClient({
   defaultOptions: { queries: { retry: 1, staleTime: 10_000 } },
@@ -138,6 +139,7 @@ function AppShell() {
           <Route path="/runs"            element={<Runs />} />
           <Route path="/runs/:runId"     element={<RunDetail />} />
           <Route path="/query"           element={<QueryEditor />} />
+          <Route path="/reference"      element={<ConfigReference />} />
           <Route path="*"               element={<Navigate to="/" />} />
         </Routes>
       </main>
