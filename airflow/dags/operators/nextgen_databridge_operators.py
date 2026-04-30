@@ -289,8 +289,11 @@ class NextGenDatabridgeBaseOperator(BaseOperator):
                     return producer
             return None
 
-        # Extract / transform tasks: confirm via XCom presence then return this task_id
-        if ti.xcom_pull(task_ids=task_id, key="duckdb_path") is not None:
+        # Return this task_id if it's a type that produces a DuckDB file.
+        # Don't gate on XCom — on retries the XCom may not be available in the
+        # current execution context even though the upstream task succeeded.
+        # The S3 path is deterministic via duckdb_s3_path(run_id, task_id).
+        if task_type in ("sql_extract", "duckdb_transform"):
             return task_id
 
         return None

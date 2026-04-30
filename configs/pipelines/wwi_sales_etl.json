@@ -87,8 +87,6 @@
     {
       "task_id": "transform_order_lines_detail",
       "type": "duckdb_transform",
-      "engine": "eks",
-      "execution": { "memory": "16Gi", "cpu": "4" },
       "depends_on": ["validate_order_lines"],
       "sql": "SELECT ol.OrderLineID, ol.OrderID, ol.StockItemID, ol.Description AS StockItemDescription, ol.Quantity, ol.UnitPrice, ol.TaxRate, ROUND(ol.Quantity * ol.UnitPrice, 2) AS LineTotal, ROUND(ol.Quantity * ol.UnitPrice * ol.TaxRate / 100.0, 2) AS TaxAmount, ROUND(ol.Quantity * ol.UnitPrice * (1 + ol.TaxRate / 100.0), 2) AS LineTotalIncTax, ol.PickedQuantity, ol.Quantity - ol.PickedQuantity AS OutstandingQty, CASE WHEN ol.PickedQuantity >= ol.Quantity THEN 'FULLY_PICKED' WHEN ol.PickedQuantity > 0 THEN 'PARTIALLY_PICKED' ELSE 'NOT_PICKED' END AS PickingStatus, ol.PickingCompletedWhen, CURRENT_TIMESTAMP AS etl_loaded_at FROM extract_order_lines.raw_order_lines ol",
       "output": {
