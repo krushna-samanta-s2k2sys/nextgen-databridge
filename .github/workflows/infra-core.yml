@@ -1,20 +1,16 @@
-name: Infrastructure Provision
+name: Infrastructure — Core
 
-# Standalone infra management: plan, apply, or destroy any environment + module.
-# Plan always runs and posts output as a job summary so you can review before approving.
-# Apply and destroy gate on GitHub Environment protection rules (approval required).
+# Manages VPC, EKS, S3, ECR, ElastiCache, and MWAA Airflow.
+# Does NOT manage any database (PostgreSQL or SQL Server) — use infra-audit-db.yml
+# and infra-source-db.yml for those.
 #
-# Role ARNs are NOT secrets — they are resource identifiers stored as workflow env vars.
-# Update the ROLE_ARN_* values below when roles are created in new accounts.
-#
-# Required repository secrets (Settings → Secrets and variables → Actions):
-#   DB_PASSWORD     — PostgreSQL password
-#   MSSQL_PASSWORD  — SQL Server password
+# DR support: set environment=dr to deploy into us-west-2.
 #
 # Required GitHub Environments (Settings → Environments):
 #   dev, staging, production, dr
 #   Add Required Reviewers to staging/production/dr to gate apply/destroy.
-#   No secrets need to be stored in the environments.
+#
+# No passwords are required — no databases are provisioned by this workflow.
 
 on:
   workflow_dispatch:
@@ -24,11 +20,6 @@ on:
         required: true
         type: choice
         options: [dev, staging, production, dr]
-      module:
-        description: "Terraform module (all = core first, then mwaa + wwi in parallel)"
-        required: true
-        type: choice
-        options: [all, core, mwaa, wwi]
       action:
         description: Action to perform
         required: true
@@ -54,14 +45,11 @@ env:
 jobs:
   # ── Resolve per-environment config ──────────────────────────────────────────
   setup:
-    name: "Setup (${{ inputs.environment }} / ${{ inputs.module }} / ${{ inputs.action }})"
+    name: "Setup (${{ inputs.environment }} / ${{ inputs.action }})"
     runs-on: ubuntu-latest
     outputs:
       aws_region: ${{ steps.cfg.outputs.aws_region }}
-      role_arn: ${{ steps.cfg.outputs.role_arn }}
-      run_core: ${{ steps.cfg.outputs.run_core }}
-      run_mwaa: ${{ steps.cfg.outputs.run_mwaa }}
-      run_wwi: ${{ steps.cfg.outputs.run_wwi }}
+      role_arn:   ${{ steps.cfg.outputs.role_arn }}
     steps:
       - name: Resolve config
         id: cfg
@@ -72,36 +60,26 @@ jobs:
             production) ROLE="${{ env.ROLE_ARN_PROD }}" ;;
             dr)         ROLE="${{ env.ROLE_ARN_DR }}" ;;
           esac
-          [[ "${{ inputs.environment }}" == "dr" ]] \
-            && REGION="${{ env.DR_REGION }}" \
-            || REGION="${{ env.PRIMARY_REGION }}"
-          ALL=$([[ "${{ inputs.module }}" == "all" ]] && echo "true" || echo "false")
-          echo "aws_region=${REGION}"                                                     >> "$GITHUB_OUTPUT"
-          echo "role_arn=${ROLE}"                                                          >> "$GITHUB_OUTPUT"
-          echo "run_core=$([[ "${{ inputs.module }}" == "core" || "$ALL" == "true" ]]     \
-            && echo true || echo false)"                                                  >> "$GITHUB_OUTPUT"
-          echo "run_mwaa=$([[ "${{ inputs.module }}" == "mwaa" || "$ALL" == "true" ]]     \
-            && echo true || echo false)"                                                  >> "$GITHUB_OUTPUT"
-          echo "run_wwi=$([[ "${{ inputs.module }}"  == "wwi"  || "$ALL" == "true" ]]     \
-            && echo true || echo false)"                                                  >> "$GITHUB_OUTPUT"
+          REGION=$([[ "${{ inputs.environment }}" == "dr" ]] \
+            && echo "${{ env.DR_REGION }}" \
+            || echo "${{ env.PRIMARY_REGION }}")
+          echo "aws_region=${REGION}" >> "$GITHUB_OUTPUT"
+          echo "role_arn=${ROLE}"     >> "$GITHUB_OUTPUT"
 
-  # ── Bootstrap: state bucket + DynamoDB lock table ───────────────────────────
+  # ── Bootstrap Terraform backend ──────────────────────────────────────────────
   bootstrap:
     name: Bootstrap Terraform Backend
     runs-on: ubuntu-latest
     needs: setup
     steps:
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
+      - uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ needs.setup.outputs.role_arn }}
           aws-region: ${{ needs.setup.outputs.aws_region }}
-
       - name: Ensure S3 state bucket + DynamoDB lock table
         run: |
           BUCKET="${{ env.STATE_BUCKET }}"
           TABLE="${{ env.LOCK_TABLE }}"
-
           if ! aws s3api head-bucket --bucket "$BUCKET" --region us-east-1 2>/dev/null; then
             aws s3api create-bucket --bucket "$BUCKET" --region us-east-1
             aws s3api put-bucket-versioning --bucket "$BUCKET" \
@@ -116,7 +94,6 @@ jobs:
           else
             echo "State bucket exists: $BUCKET"
           fi
-
           if ! aws dynamodb describe-table --table-name "$TABLE" --region us-east-1 2>/dev/null; then
             aws dynamodb create-table \
               --table-name "$TABLE" --region us-east-1 \
@@ -130,14 +107,13 @@ jobs:
           fi
 
   # ════════════════════════════════════════════════════════════════════════════
-  # PLAN JOBS — always run, no approval gate, post plan output as summary
+  # PLAN — core
   # ════════════════════════════════════════════════════════════════════════════
 
   plan-core:
     name: Plan — core
     runs-on: ubuntu-latest
     needs: [setup, bootstrap]
-    if: needs.setup.outputs.run_core == 'true'
     steps:
       - uses: actions/checkout@v4
       - uses: aws-actions/configure-aws-credentials@v4
@@ -157,9 +133,6 @@ jobs:
             -backend-config="dynamodb_table=${{ env.LOCK_TABLE }}"
       - name: terraform plan
         working-directory: infra/terraform/core
-        env:
-          TF_VAR_db_password: ${{ secrets.DB_PASSWORD }}
-          TF_VAR_mssql_password: ${{ secrets.MSSQL_PASSWORD }}
         run: |
           set -o pipefail
           terraform plan \
@@ -184,12 +157,14 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
+  # PLAN — mwaa (runs after apply-core so it can see new VPC/EKS outputs;
+  #              when action=plan, apply-core is skipped and this still runs)
   plan-mwaa:
     name: Plan — mwaa
     runs-on: ubuntu-latest
     needs: [setup, apply-core]
     if: |
-      needs.setup.outputs.run_mwaa == 'true' &&
+      always() &&
       (needs.apply-core.result == 'success' || needs.apply-core.result == 'skipped')
     steps:
       - uses: actions/checkout@v4
@@ -210,9 +185,6 @@ jobs:
             -backend-config="dynamodb_table=${{ env.LOCK_TABLE }}"
       - name: terraform plan
         working-directory: infra/terraform/mwaa
-        env:
-          TF_VAR_db_password: ${{ secrets.DB_PASSWORD }}
-          TF_VAR_mssql_password: ${{ secrets.MSSQL_PASSWORD }}
         run: |
           set -o pipefail
           terraform plan \
@@ -238,72 +210,15 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
-  plan-wwi:
-    name: Plan — wwi
-    runs-on: ubuntu-latest
-    needs: [setup, apply-core]
-    if: |
-      needs.setup.outputs.run_wwi == 'true' &&
-      (needs.apply-core.result == 'success' || needs.apply-core.result == 'skipped')
-    steps:
-      - uses: actions/checkout@v4
-      - uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: ${{ needs.setup.outputs.role_arn }}
-          aws-region: ${{ needs.setup.outputs.aws_region }}
-      - uses: hashicorp/setup-terraform@v3
-        with:
-          terraform_version: ${{ env.TF_VERSION }}
-      - name: terraform init
-        working-directory: infra/terraform/wwi
-        run: |
-          terraform init \
-            -backend-config="bucket=${{ env.STATE_BUCKET }}" \
-            -backend-config="key=nextgen-databridge/${{ inputs.environment }}/wwi/terraform.tfstate" \
-            -backend-config="region=us-east-1" \
-            -backend-config="dynamodb_table=${{ env.LOCK_TABLE }}"
-      - name: terraform plan
-        working-directory: infra/terraform/wwi
-        env:
-          TF_VAR_db_password: ${{ secrets.DB_PASSWORD }}
-          TF_VAR_mssql_password: ${{ secrets.MSSQL_PASSWORD }}
-        run: |
-          set -o pipefail
-          terraform plan \
-            -var="environment=${{ inputs.environment }}" \
-            -var="aws_region=${{ needs.setup.outputs.aws_region }}" \
-            ${{ inputs.action == 'destroy' && '-destroy' || '' }} \
-            -out=tfplan-wwi.bin -no-color 2>&1 | tee tfplan-wwi.txt
-      - uses: actions/upload-artifact@v4
-        with:
-          name: tfplan-${{ inputs.environment }}-wwi
-          path: |
-            infra/terraform/wwi/tfplan-wwi.bin
-            infra/terraform/wwi/tfplan-wwi.txt
-          retention-days: 1
-      - name: Post plan summary
-        if: always()
-        run: |
-          {
-            echo "### Terraform Plan — wwi \`${{ inputs.environment }}\`"
-            echo '```hcl'
-            cat infra/terraform/wwi/tfplan-wwi.txt
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
-
   # ════════════════════════════════════════════════════════════════════════════
-  # APPLY / DESTROY JOBS — gated on GitHub Environment approval
-  # Dependency order: core must succeed before mwaa + wwi (when deploying all)
+  # APPLY / DESTROY — gated by GitHub Environment approval
   # ════════════════════════════════════════════════════════════════════════════
 
   apply-core:
     name: "${{ inputs.action == 'destroy' && 'Destroy' || 'Apply' }} — core"
     runs-on: ubuntu-latest
     needs: [setup, plan-core]
-    if: |
-      needs.setup.outputs.run_core == 'true' &&
-      inputs.action != 'plan' &&
-      needs.plan-core.result == 'success'
+    if: inputs.action != 'plan' && needs.plan-core.result == 'success'
     environment: ${{ inputs.environment }}
     steps:
       - uses: actions/checkout@v4
@@ -329,13 +244,21 @@ jobs:
       - name: terraform apply
         working-directory: infra/terraform/core
         run: terraform apply -auto-approve tfplan-core.bin
+      - name: Upload pipeline configs
+        if: inputs.action == 'apply'
+        run: |
+          BUCKET="nextgen-databridge-pipeline-configs-${{ inputs.environment }}"
+          aws s3 cp configs/environments/${{ inputs.environment }}.json \
+            s3://${BUCKET}/environments/${{ inputs.environment }}.json 2>/dev/null || true
+          for f in configs/pipelines/*.json; do
+            aws s3 cp "$f" s3://${BUCKET}/active/$(basename "$f") 2>/dev/null || true
+          done
 
   apply-mwaa:
     name: "${{ inputs.action == 'destroy' && 'Destroy' || 'Apply' }} — mwaa"
     runs-on: ubuntu-latest
     needs: [setup, plan-mwaa, apply-core]
     if: |
-      needs.setup.outputs.run_mwaa == 'true' &&
       inputs.action != 'plan' &&
       needs.plan-mwaa.result == 'success' &&
       (needs.apply-core.result == 'success' || needs.apply-core.result == 'skipped')
@@ -369,67 +292,22 @@ jobs:
         run: |
           MWAA_BUCKET=$(cd infra/terraform/mwaa && terraform output -raw mwaa_bucket)
           MWAA_BUCKET="$MWAA_BUCKET" bash airflow/deploy_to_mwaa.sh
-      - name: Upload pipeline configs to S3
-        if: inputs.action == 'apply'
-        run: |
-          BUCKET="nextgen-databridge-pipeline-configs-${{ inputs.environment }}"
-          aws s3 cp configs/environments/${{ inputs.environment }}.json \
-            s3://${BUCKET}/environments/${{ inputs.environment }}.json
-          for f in configs/pipelines/*.json; do
-            aws s3 cp "$f" s3://${BUCKET}/active/$(basename "$f")
-          done
 
-  apply-wwi:
-    name: "${{ inputs.action == 'destroy' && 'Destroy' || 'Apply' }} — wwi"
-    runs-on: ubuntu-latest
-    needs: [setup, plan-wwi, apply-core]
-    if: |
-      needs.setup.outputs.run_wwi == 'true' &&
-      inputs.action != 'plan' &&
-      needs.plan-wwi.result == 'success' &&
-      (needs.apply-core.result == 'success' || needs.apply-core.result == 'skipped')
-    environment: ${{ inputs.environment }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: ${{ needs.setup.outputs.role_arn }}
-          aws-region: ${{ needs.setup.outputs.aws_region }}
-      - uses: hashicorp/setup-terraform@v3
-        with:
-          terraform_version: ${{ env.TF_VERSION }}
-      - uses: actions/download-artifact@v4
-        with:
-          name: tfplan-${{ inputs.environment }}-wwi
-          path: infra/terraform/wwi/
-      - name: terraform init
-        working-directory: infra/terraform/wwi
-        run: |
-          terraform init \
-            -backend-config="bucket=${{ env.STATE_BUCKET }}" \
-            -backend-config="key=nextgen-databridge/${{ inputs.environment }}/wwi/terraform.tfstate" \
-            -backend-config="region=us-east-1" \
-            -backend-config="dynamodb_table=${{ env.LOCK_TABLE }}"
-      - name: terraform apply
-        working-directory: infra/terraform/wwi
-        run: terraform apply -auto-approve tfplan-wwi.bin
-
-  # ── Job summary ──────────────────────────────────────────────────────────────
+  # ── Summary ──────────────────────────────────────────────────────────────────
   summary:
     name: Summary
     runs-on: ubuntu-latest
-    needs: [setup, apply-core, apply-mwaa, apply-wwi]
+    needs: [setup, apply-core, apply-mwaa]
     if: always() && inputs.action != 'plan'
     steps:
       - name: Write summary
         run: |
           {
-            echo "## Infrastructure ${{ inputs.action }} Summary"
+            echo "## Core Infrastructure — ${{ inputs.action }}"
             echo ""
             echo "| Field | Value |"
             echo "|---|---|"
             echo "| Environment | \`${{ inputs.environment }}\` |"
-            echo "| Module | \`${{ inputs.module }}\` |"
             echo "| Region | \`${{ needs.setup.outputs.aws_region }}\` |"
             echo "| Action | \`${{ inputs.action }}\` |"
             echo "| Actor | @${{ github.actor }} |"
@@ -439,5 +317,4 @@ jobs:
             echo "|---|---|"
             echo "| core | ${{ needs.apply-core.result }} |"
             echo "| mwaa | ${{ needs.apply-mwaa.result }} |"
-            echo "| wwi  | ${{ needs.apply-wwi.result }} |"
           } >> "$GITHUB_STEP_SUMMARY"

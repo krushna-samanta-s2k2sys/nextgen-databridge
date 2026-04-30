@@ -1,5 +1,12 @@
 #!/usr/bin/env python3
-"""Create all NextGenDatabridge audit tables in the PostgreSQL RDS instance."""
+"""Create all NextGenDatabridge audit tables in the PostgreSQL RDS instance.
+
+Required environment variable:
+  DATABASE_URL  — PostgreSQL connection URL, e.g.
+                  postgresql+psycopg2://airflow:<password>@<host>:5432/airflow
+                  In CI this is read from Secrets Manager by the calling workflow.
+"""
+import os
 import sqlalchemy as sa
 from sqlalchemy import (
     Column, String, Integer, BigInteger, Float, Boolean, DateTime,
@@ -287,7 +294,7 @@ sa.Table('pipeline_metrics', meta,
 )
 
 # ── Create all enums then tables ───────────────────────────────────────────────
-url    = 'postgresql+psycopg2://airflow:ActionDag!1@nextgen-databridge-postgres.cor0mwswyvz9.us-east-1.rds.amazonaws.com:5432/airflow'
+url    = os.environ["DATABASE_URL"]
 engine = sa.create_engine(url, echo=False)
 
 all_enums = [
