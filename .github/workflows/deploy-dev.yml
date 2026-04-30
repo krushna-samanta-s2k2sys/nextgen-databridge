@@ -351,7 +351,88 @@ jobs:
             kubectl get pods -n nextgen-databridge
           fi
 
-  # ── 6. Record image tag in SSM for promotion ─────────────────────────────────
+  # ── 6. Register pipeline configs in PostgreSQL ───────────────────────────────
+  register-pipelines:
+    name: Register Pipeline Configs
+    runs-on: ubuntu-latest
+    needs: [guard, smoke-test, sync-configs]
+    if: |
+      always() &&
+      needs.guard.result == 'success' &&
+      (
+        needs.smoke-test.result == 'success' ||
+        (needs.smoke-test.result == 'skipped' && needs.guard.outputs.sync_configs == 'true')
+      )
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - uses: azure/setup-kubectl@v4
+
+      - name: Update kubeconfig
+        run: |
+          aws eks update-kubeconfig \
+            --region "${{ env.AWS_REGION }}" \
+            --name "${{ env.CLUSTER_NAME }}"
+
+      - name: Register pipelines
+        run: |
+          API_HOST=$(kubectl get svc nextgen-databridge-api -n nextgen-databridge \
+            -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "")
+          if [[ -z "$API_HOST" ]]; then
+            echo "::error::Could not resolve API service hostname — cannot register pipelines."
+            exit 1
+          fi
+          API_BASE="http://${API_HOST}/api"
+          echo "API base: ${API_BASE}"
+
+          CREATED=0; UPDATED=0; FAILED=0
+          for f in configs/pipelines/*.json; do
+            PIPELINE_ID=$(jq -r '.pipeline_id' "$f")
+
+            HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "${API_BASE}/pipelines/${PIPELINE_ID}")
+
+            if [[ "$HTTP_STATUS" == "200" ]]; then
+              BODY=$(jq '{name: (.pipeline_id | gsub("_"; " ")), description: .description, config: ., schedule: .schedule, tags: (.tags // []), sla_minutes: .sla_minutes}' "$f")
+              STATUS=$(curl -s -o /dev/null -w "%{http_code}" -X PUT "${API_BASE}/pipelines/${PIPELINE_ID}" \
+                -H "Content-Type: application/json" -d "$BODY")
+              if [[ "$STATUS" =~ ^2 ]]; then
+                echo "  ✓ Updated ${PIPELINE_ID}"
+                UPDATED=$((UPDATED + 1))
+              else
+                echo "  ✗ Update failed for ${PIPELINE_ID}: HTTP ${STATUS}"
+                FAILED=$((FAILED + 1))
+              fi
+            else
+              BODY=$(jq '{pipeline_id: .pipeline_id, name: (.pipeline_id | gsub("_"; " ")), description: .description, config: ., schedule: .schedule, tags: (.tags // []), owner: .owner, sla_minutes: .sla_minutes}' "$f")
+              STATUS=$(curl -s -o /dev/null -w "%{http_code}" -X POST "${API_BASE}/pipelines" \
+                -H "Content-Type: application/json" -d "$BODY")
+              if [[ "$STATUS" =~ ^2 ]]; then
+                echo "  ✓ Created ${PIPELINE_ID}"
+                CREATED=$((CREATED + 1))
+              else
+                echo "  ✗ Create failed for ${PIPELINE_ID}: HTTP ${STATUS}"
+                FAILED=$((FAILED + 1))
+              fi
+            fi
+          done
+
+          {
+            echo "### Pipeline Registration"
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Created | ${CREATED} |"
+            echo "| Updated | ${UPDATED} |"
+            echo "| Failed  | ${FAILED} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          [[ "$FAILED" -eq 0 ]] || { echo "::error::${FAILED} pipeline(s) failed to register."; exit 1; }
+
+  # ── 7. Record image tag in SSM for promotion ─────────────────────────────────
   record-image-tag:
     name: Record Image Tag
     runs-on: ubuntu-latest
@@ -374,11 +455,11 @@ jobs:
             --type String --overwrite
           echo "Recorded dev image tag: sha-${{ github.sha }}"
 
-  # ── 7. Summary + notification ─────────────────────────────────────────────────
+  # ── 8. Summary + notification ─────────────────────────────────────────────────
   summary:
     name: Deployment Summary
     runs-on: ubuntu-latest
-    needs: [guard, build-meta, deploy-apps, smoke-test, sync-dags, sync-configs]
+    needs: [guard, build-meta, deploy-apps, smoke-test, sync-dags, sync-configs, register-pipelines]
     if: always() && (github.event_name == 'workflow_dispatch' || github.event.pull_request.merged == true)
     steps:
       - name: Write job summary
@@ -402,6 +483,7 @@ jobs:
             echo "| Smoke Tests | ${{ needs.smoke-test.result }} |"
             echo "| Sync DAGs | ${{ needs.sync-dags.result }} |"
             echo "| Sync Configs | ${{ needs.sync-configs.result }} |"
+            echo "| Register Pipelines | ${{ needs.register-pipelines.result }} |"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Notify Slack on failure
