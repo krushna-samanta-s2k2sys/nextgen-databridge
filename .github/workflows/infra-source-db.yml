@@ -1,0 +1,212 @@
+name: Infrastructure — Source DB
+
+# Manages the RDS SQL Server instance, then restores the WideWorldImporters
+# database from S3 and creates all TargetDB tables.
+#
+# Prerequisite: infra-core.yml must have been applied first (VPC and artifacts
+# S3 bucket must exist before this workflow can run).
+#
+# Password handling:
+#   Provide mssql_password as a workflow input for first-time or one-off
+#   deployments.  For routine use configure the MSSQL_PASSWORD repository
+#   secret and leave the input blank — the workflow falls back automatically.
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Target environment
+        required: true
+        type: choice
+        options: [dev, staging, production, dr]
+      action:
+        description: Action to perform
+        required: true
+        type: choice
+        options: [plan, apply, destroy]
+      mssql_password:
+        description: "SQL Server password (user: sqladmin). Leave blank to use repository secret MSSQL_PASSWORD."
+        required: false
+        default: ""
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  TF_VERSION: "~1.6"
+  PRIMARY_REGION: us-east-1
+  DR_REGION: us-west-2
+  STATE_BUCKET: nextgen-databridge-terraform-state
+  LOCK_TABLE: nextgen-databridge-terraform-locks
+  ROLE_ARN_DEV:        arn:aws:iam::877707676590:role/nextgen-databridge-github-actions-dev
+  ROLE_ARN_STAGING:    arn:aws:iam::STAGING_ACCOUNT_ID:role/nextgen-databridge-github-actions-staging
+  ROLE_ARN_PROD:       arn:aws:iam::PROD_ACCOUNT_ID:role/nextgen-databridge-github-actions-production
+  ROLE_ARN_DR:         arn:aws:iam::DR_ACCOUNT_ID:role/nextgen-databridge-github-actions-dr
+
+jobs:
+  setup:
+    name: "Setup (${{ inputs.environment }} / ${{ inputs.action }})"
+    runs-on: ubuntu-latest
+    outputs:
+      aws_region: ${{ steps.cfg.outputs.aws_region }}
+      role_arn:   ${{ steps.cfg.outputs.role_arn }}
+    steps:
+      - name: Resolve config
+        id: cfg
+        run: |
+          case "${{ inputs.environment }}" in
+            dev)        ROLE="${{ env.ROLE_ARN_DEV }}" ;;
+            staging)    ROLE="${{ env.ROLE_ARN_STAGING }}" ;;
+            production) ROLE="${{ env.ROLE_ARN_PROD }}" ;;
+            dr)         ROLE="${{ env.ROLE_ARN_DR }}" ;;
+          esac
+          REGION=$([[ "${{ inputs.environment }}" == "dr" ]] \
+            && echo "${{ env.DR_REGION }}" \
+            || echo "${{ env.PRIMARY_REGION }}")
+          echo "aws_region=${REGION}" >> "$GITHUB_OUTPUT"
+          echo "role_arn=${ROLE}"     >> "$GITHUB_OUTPUT"
+
+  plan:
+    name: Plan — source-db
+    runs-on: ubuntu-latest
+    needs: setup
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ needs.setup.outputs.role_arn }}
+          aws-region: ${{ needs.setup.outputs.aws_region }}
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Resolve MSSQL password
+        id: pw
+        run: |
+          PW="${{ inputs.mssql_password }}"
+          if [[ -z "$PW" ]]; then
+            PW="${{ secrets.MSSQL_PASSWORD }}"
+          fi
+          if [[ -z "$PW" ]] && [[ "${{ inputs.action }}" != "plan" ]]; then
+            echo "ERROR: SQL Server password is required for apply/destroy."
+            echo "Provide it via the mssql_password workflow input or the MSSQL_PASSWORD repository secret."
+            exit 1
+          fi
+          echo "::add-mask::$PW"
+          echo "value=$PW" >> "$GITHUB_OUTPUT"
+
+      - name: terraform init
+        working-directory: infra/terraform/wwi
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ env.STATE_BUCKET }}" \
+            -backend-config="key=nextgen-databridge/${{ inputs.environment }}/wwi/terraform.tfstate" \
+            -backend-config="region=us-east-1" \
+            -backend-config="dynamodb_table=${{ env.LOCK_TABLE }}"
+
+      - name: terraform plan
+        working-directory: infra/terraform/wwi
+        env:
+          TF_VAR_mssql_password: ${{ steps.pw.outputs.value }}
+        run: |
+          set -o pipefail
+          terraform plan \
+            -var="environment=${{ inputs.environment }}" \
+            -var="aws_region=${{ needs.setup.outputs.aws_region }}" \
+            ${{ inputs.action == 'destroy' && '-destroy' || '' }} \
+            -out=tfplan-wwi.bin -no-color 2>&1 | tee tfplan-wwi.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tfplan-${{ inputs.environment }}-wwi
+          path: |
+            infra/terraform/wwi/tfplan-wwi.bin
+            infra/terraform/wwi/tfplan-wwi.txt
+          retention-days: 1
+
+      - name: Post plan summary
+        if: always()
+        run: |
+          {
+            echo "### Terraform Plan — source-db (wwi) \`${{ inputs.environment }}\`"
+            echo '```hcl'
+            cat infra/terraform/wwi/tfplan-wwi.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  apply:
+    name: "${{ inputs.action == 'destroy' && 'Destroy' || 'Apply' }} — source-db"
+    runs-on: ubuntu-latest
+    needs: [setup, plan]
+    if: inputs.action != 'plan' && needs.plan.result == 'success'
+    environment: ${{ inputs.environment }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ needs.setup.outputs.role_arn }}
+          aws-region: ${{ needs.setup.outputs.aws_region }}
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: tfplan-${{ inputs.environment }}-wwi
+          path: infra/terraform/wwi/
+
+      - name: terraform init
+        working-directory: infra/terraform/wwi
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ env.STATE_BUCKET }}" \
+            -backend-config="key=nextgen-databridge/${{ inputs.environment }}/wwi/terraform.tfstate" \
+            -backend-config="region=us-east-1" \
+            -backend-config="dynamodb_table=${{ env.LOCK_TABLE }}"
+
+      - name: terraform apply
+        working-directory: infra/terraform/wwi
+        run: terraform apply -auto-approve tfplan-wwi.bin
+
+      # After apply, restore WideWorldImporters and create TargetDB tables
+      - name: Restore WideWorldImporters and create TargetDB
+        if: inputs.action == 'apply'
+        run: |
+          pip install --quiet pymssql boto3
+          SQLSERVER_HOST=$(cd infra/terraform/wwi && terraform output -raw sqlserver_endpoint)
+          ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
+          ARTIFACTS_BUCKET="nextgen-databridge-artifacts-${{ inputs.environment }}"
+
+          # Resolve password from Secrets Manager (Terraform wrote it there)
+          MSSQL_PASSWORD=$(aws secretsmanager get-secret-value \
+            --secret-id "nextgen-databridge/connections/wwi_sqlserver" \
+            --query SecretString --output text | \
+            python3 -c "import json,sys; d=json.loads(sys.stdin.read()); print(d['password'])")
+          echo "::add-mask::$MSSQL_PASSWORD"
+
+          export SQLSERVER_HOST ARTIFACTS_BUCKET AWS_ACCOUNT_ID="$ACCOUNT" \
+                 AWS_DEFAULT_REGION="${{ needs.setup.outputs.aws_region }}" \
+                 MSSQL_PASSWORD
+          python scripts/setup_databases.py
+          echo "WideWorldImporters restore and TargetDB schema complete."
+
+  summary:
+    name: Summary
+    runs-on: ubuntu-latest
+    needs: [setup, plan, apply]
+    if: always()
+    steps:
+      - name: Write summary
+        run: |
+          {
+            echo "## Source DB — ${{ inputs.action }}"
+            echo ""
+            echo "| Field | Value |"
+            echo "|---|---|"
+            echo "| Environment | \`${{ inputs.environment }}\` |"
+            echo "| Region | \`${{ needs.setup.outputs.aws_region }}\` |"
+            echo "| Action | \`${{ inputs.action }}\` |"
+            echo "| Actor | @${{ github.actor }} |"
+            echo "| Plan | ${{ needs.plan.result }} |"
+            echo "| Apply/Destroy | ${{ needs.apply.result }} |"
+          } >> "$GITHUB_STEP_SUMMARY"

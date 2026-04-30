@@ -138,78 +138,6 @@ resource "aws_s3_bucket" "artifacts" {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# RDS PostgreSQL  (audit / Airflow metadata database)
-# ─────────────────────────────────────────────────────────────────────────────
-resource "aws_db_subnet_group" "postgres" {
-  name       = "nextgen-databridge-postgres"
-  subnet_ids = module.vpc.public_subnets
-}
-
-resource "aws_security_group" "rds" {
-  name   = "nextgen-databridge-rds"
-  vpc_id = module.vpc.vpc_id
-
-  ingress {
-    description = "PostgreSQL open access"
-    from_port   = 5432
-    to_port     = 5432
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-  egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-}
-
-resource "aws_db_instance" "main" {
-  identifier            = "nextgen-databridge-postgres"
-  engine                = "postgres"
-  engine_version        = "15.10"
-  instance_class        = var.environment == "production" ? "db.r6g.large" : "db.t3.medium"
-  allocated_storage     = 100
-  max_allocated_storage = 1000
-  storage_encrypted     = true
-  storage_type          = "gp3"
-  db_name               = "airflow"
-  username              = "airflow"
-  password              = var.db_password
-
-  db_subnet_group_name   = aws_db_subnet_group.postgres.name
-  vpc_security_group_ids = [aws_security_group.rds.id]
-  publicly_accessible    = true
-  multi_az               = var.environment == "production"
-
-  backup_retention_period      = 7
-  skip_final_snapshot          = var.environment != "production"
-  performance_insights_enabled = true
-  deletion_protection          = var.environment == "production"
-}
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Secrets Manager — audit DB connection (dynamic values from Terraform)
-# ─────────────────────────────────────────────────────────────────────────────
-resource "aws_secretsmanager_secret" "audit_db" {
-  name                    = "nextgen-databridge/connections/audit_db"
-  recovery_window_in_days = 0
-}
-
-resource "aws_secretsmanager_secret_version" "audit_db" {
-  secret_id = aws_secretsmanager_secret.audit_db.id
-  secret_string = jsonencode({
-    conn_type = "postgresql"
-    host      = aws_db_instance.main.address
-    port      = 5432
-    login     = "airflow"
-    password  = var.db_password
-    schema    = "airflow"
-    url       = "postgresql://airflow:${var.db_password}@${aws_db_instance.main.address}:5432/airflow"
-  })
-}
-
-# ─────────────────────────────────────────────────────────────────────────────
 # ElastiCache Redis
 # ─────────────────────────────────────────────────────────────────────────────
 resource "aws_elasticache_subnet_group" "main" {
@@ -324,7 +252,6 @@ output "cluster_name"            { value = module.eks.cluster_name }
 output "cluster_endpoint"        { value = module.eks.cluster_endpoint }
 output "oidc_provider_arn"       { value = module.eks.oidc_provider_arn }
 output "vpc_id"                  { value = module.vpc.vpc_id }
-output "audit_db_endpoint"       { value = aws_db_instance.main.address }
 output "redis_endpoint"          { value = aws_elasticache_replication_group.main.primary_endpoint_address }
 output "duckdb_bucket"           { value = aws_s3_bucket.duckdb_store.id }
 output "pipeline_configs_bucket" { value = aws_s3_bucket.pipeline_configs.id }

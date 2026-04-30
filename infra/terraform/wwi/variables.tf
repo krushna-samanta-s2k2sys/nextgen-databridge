@@ -5,8 +5,8 @@ variable "aws_region" {
 variable "environment" {
   default = "dev"
   validation {
-    condition     = contains(["dev", "staging", "production"], var.environment)
-    error_message = "Must be dev, staging, or production."
+    condition     = contains(["dev", "staging", "production", "dr"], var.environment)
+    error_message = "Must be dev, staging, production, or dr."
   }
 }
 
@@ -18,10 +18,6 @@ variable "mssql_password" {
 variable "sqlserver_version" {
   default     = "15.00.4345.5.v1"
   description = "RDS SQL Server engine version. 15.00.x = SQL Server 2019 SE."
-}
-
-variable "vpc_cidr" {
-  default = "10.0.0.0/16"
 }
 
 variable "developer_cidr_blocks" {
