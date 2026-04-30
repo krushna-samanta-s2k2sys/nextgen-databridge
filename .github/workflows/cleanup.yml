@@ -1,0 +1,468 @@
+name: Emergency Cleanup
+
+# Bypasses Terraform and deletes all NextGenDatabridge resources directly via AWS CLI.
+# Use this when "Infrastructure Provision → destroy" fails.
+#
+# Deletion order:
+#   1. K8s LoadBalancer services  → triggers NLB teardown (the most common blocker)
+#   2. MWAA environment           → long (~20 min); kicked off early, waited on later
+#   3. RDS SQL Server + PostgreSQL (parallel wait)
+#   4. ElastiCache replication group
+#   5. EKS node groups + cluster  → after MWAA access entries are gone
+#   6. S3 buckets                 → paginated version/marker purge before deletion
+#   7. Secrets Manager / ECR / IAM / SSM
+#   8. Security groups / RDS subnet groups / option groups
+#   9. VPC: NAT GW → EIPs → IGW → ENIs → subnets → route tables → VPC
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Environment to destroy
+        required: true
+        type: choice
+        options: [dev, staging, production]
+      confirm:
+        description: "Type the environment name again to confirm"
+        required: true
+        default: ""
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  PRIMARY_REGION: us-east-1
+  ROLE_ARN_DEV:        arn:aws:iam::877707676590:role/nextgen-databridge-github-actions-dev
+  ROLE_ARN_STAGING:    arn:aws:iam::STAGING_ACCOUNT_ID:role/nextgen-databridge-github-actions-staging
+  ROLE_ARN_PROD:       arn:aws:iam::PROD_ACCOUNT_ID:role/nextgen-databridge-github-actions-production
+
+jobs:
+  cleanup:
+    name: "Destroy all resources — ${{ inputs.environment }}"
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    steps:
+
+      - name: Safety confirmation check
+        run: |
+          if [[ "${{ inputs.confirm }}" != "${{ inputs.environment }}" ]]; then
+            echo "ERROR: confirmation '${{ inputs.confirm }}' does not match '${{ inputs.environment }}'"
+            exit 1
+          fi
+
+      - name: Resolve role
+        id: cfg
+        run: |
+          case "${{ inputs.environment }}" in
+            dev)        ROLE="${{ env.ROLE_ARN_DEV }}" ;;
+            staging)    ROLE="${{ env.ROLE_ARN_STAGING }}" ;;
+            production) ROLE="${{ env.ROLE_ARN_PROD }}" ;;
+          esac
+          echo "role_arn=${ROLE}" >> "$GITHUB_OUTPUT"
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ steps.cfg.outputs.role_arn }}
+          aws-region: ${{ env.PRIMARY_REGION }}
+
+      # ── 1. Delete Kubernetes LoadBalancer services ──────────────────────────
+      # NLBs created by K8s are NOT tracked by Terraform. Their ENIs block VPC
+      # deletion. Removing the K8s service causes AWS to decommission the NLB.
+      - name: Delete K8s LoadBalancer services
+        run: |
+          CLUSTER="nextgen-databridge"
+          STATUS=$(aws eks describe-cluster --name "$CLUSTER" \
+            --query 'cluster.status' --output text 2>/dev/null || echo "NOT_FOUND")
+          if [[ "$STATUS" == "ACTIVE" ]]; then
+            aws eks update-kubeconfig --name "$CLUSTER" --region "${{ env.PRIMARY_REGION }}"
+            kubectl get svc --all-namespaces \
+              -o jsonpath='{range .items[?(@.spec.type=="LoadBalancer")]}{.metadata.namespace}{" "}{.metadata.name}{"\n"}{end}' \
+            | while read -r NS SVC; do
+                [[ -z "$SVC" ]] && continue
+                echo "Deleting svc/$SVC in $NS"
+                kubectl delete svc "$SVC" -n "$NS" --ignore-not-found --timeout=120s || true
+              done
+            echo "Waiting 90s for NLBs to deregister..."
+            sleep 90
+          else
+            echo "EKS cluster not ACTIVE ($STATUS) — skipping."
+          fi
+
+      # ── 2. Kick off MWAA deletion (async, ~20 min) ─────────────────────────
+      - name: Delete MWAA environment (async)
+        run: |
+          STATUS=$(aws mwaa get-environment --name "nextgen-databridge" \
+            --query 'Environment.Status' --output text 2>/dev/null || echo "NOT_FOUND")
+          if [[ "$STATUS" == "NOT_FOUND" || "$STATUS" == "DELETED" ]]; then
+            echo "MWAA not found — skipping."
+          else
+            echo "Initiating MWAA deletion (status: $STATUS)..."
+            aws mwaa delete-environment --name "nextgen-databridge"
+          fi
+
+      # ── 3. Delete RDS instances (SQL Server first, then Postgres) ───────────
+      - name: Delete RDS SQL Server
+        run: |
+          ID="nextgen-databridge-sqlserver"
+          STATUS=$(aws rds describe-db-instances --db-instance-identifier "$ID" \
+            --query 'DBInstances[0].DBInstanceStatus' --output text 2>/dev/null || echo "not-found")
+          if [[ "$STATUS" == "not-found" ]]; then
+            echo "SQL Server not found — skipping."
+          else
+            aws rds modify-db-instance --db-instance-identifier "$ID" \
+              --no-deletion-protection --apply-immediately 2>/dev/null || true
+            aws rds delete-db-instance --db-instance-identifier "$ID" \
+              --skip-final-snapshot --delete-automated-backups
+            echo "Waiting for SQL Server deletion..."
+            aws rds wait db-instance-deleted --db-instance-identifier "$ID"
+            echo "SQL Server deleted."
+          fi
+
+      - name: Delete RDS PostgreSQL
+        run: |
+          ID="nextgen-databridge-postgres"
+          STATUS=$(aws rds describe-db-instances --db-instance-identifier "$ID" \
+            --query 'DBInstances[0].DBInstanceStatus' --output text 2>/dev/null || echo "not-found")
+          if [[ "$STATUS" == "not-found" ]]; then
+            echo "PostgreSQL not found — skipping."
+          else
+            aws rds modify-db-instance --db-instance-identifier "$ID" \
+              --no-deletion-protection --apply-immediately 2>/dev/null || true
+            aws rds delete-db-instance --db-instance-identifier "$ID" \
+              --skip-final-snapshot --delete-automated-backups
+            echo "Waiting for PostgreSQL deletion..."
+            aws rds wait db-instance-deleted --db-instance-identifier "$ID"
+            echo "PostgreSQL deleted."
+          fi
+
+      # ── 4. Delete ElastiCache ───────────────────────────────────────────────
+      - name: Delete ElastiCache Redis
+        run: |
+          ID="nextgen-databridge-redis"
+          STATUS=$(aws elasticache describe-replication-groups \
+            --replication-group-id "$ID" \
+            --query 'ReplicationGroups[0].Status' --output text 2>/dev/null || echo "not-found")
+          if [[ "$STATUS" == "not-found" ]]; then
+            echo "ElastiCache not found — skipping."
+          else
+            aws elasticache delete-replication-group \
+              --replication-group-id "$ID" --no-retain-primary-cluster
+            echo "Waiting for ElastiCache deletion..."
+            aws elasticache wait replication-group-deleted \
+              --replication-group-id "$ID"
+            echo "ElastiCache deleted."
+          fi
+
+      # ── 5. Wait for MWAA, then delete EKS ──────────────────────────────────
+      - name: Wait for MWAA deletion
+        run: |
+          echo "Polling MWAA deletion (up to 30 min)..."
+          for i in $(seq 1 60); do
+            STATUS=$(aws mwaa get-environment --name "nextgen-databridge" \
+              --query 'Environment.Status' --output text 2>/dev/null || echo "NOT_FOUND")
+            echo "[${i}/60] MWAA: ${STATUS}"
+            [[ "$STATUS" == "NOT_FOUND" || "$STATUS" == "DELETED" ]] && break
+            sleep 30
+          done
+
+      - name: Delete EKS node groups and cluster
+        run: |
+          CLUSTER="nextgen-databridge"
+          if ! aws eks describe-cluster --name "$CLUSTER" \
+              --query 'cluster.name' --output text 2>/dev/null | grep -q "$CLUSTER"; then
+            echo "EKS cluster not found — skipping."
+            exit 0
+          fi
+
+          for NG in $(aws eks list-nodegroups --cluster-name "$CLUSTER" \
+              --query 'nodegroups[]' --output text 2>/dev/null); do
+            echo "Deleting node group: $NG"
+            aws eks delete-nodegroup --cluster-name "$CLUSTER" --nodegroup-name "$NG"
+            aws eks wait nodegroup-deleted --cluster-name "$CLUSTER" --nodegroup-name "$NG"
+          done
+
+          for ENTRY in $(aws eks list-access-entries --cluster-name "$CLUSTER" \
+              --query 'accessEntries[]' --output text 2>/dev/null); do
+            aws eks delete-access-entry --cluster-name "$CLUSTER" \
+              --principal-arn "$ENTRY" 2>/dev/null || true
+          done
+
+          aws eks delete-cluster --name "$CLUSTER"
+          aws eks wait cluster-deleted --name "$CLUSTER"
+          echo "EKS cluster deleted."
+
+      # ── 6. Empty and delete S3 buckets ──────────────────────────────────────
+      # Uses a paginated Python loop so buckets with >1000 versions are fully purged.
+      - name: Delete S3 buckets
+        env:
+          ENVIRONMENT: ${{ inputs.environment }}
+        run: |
+          pip install --quiet boto3
+          python3 - << 'PYEOF'
+          import boto3, os
+
+          s3 = boto3.client('s3', region_name='us-east-1')
+          env = os.environ['ENVIRONMENT']
+          buckets = [
+              f'nextgen-databridge-mwaa-{env}',
+              f'nextgen-databridge-duckdb-store-{env}',
+              f'nextgen-databridge-pipeline-configs-{env}',
+              f'nextgen-databridge-artifacts-{env}',
+          ]
+
+          for bucket in buckets:
+              try:
+                  s3.head_bucket(Bucket=bucket)
+              except Exception:
+                  print(f'{bucket}: not found — skipping')
+                  continue
+
+              print(f'{bucket}: emptying (paginated)...')
+              paginator = s3.get_paginator('list_object_versions')
+              total = 0
+              for page in paginator.paginate(Bucket=bucket):
+                  to_delete = [
+                      {'Key': v['Key'], 'VersionId': v['VersionId']}
+                      for v in page.get('Versions', [])
+                  ] + [
+                      {'Key': m['Key'], 'VersionId': m['VersionId']}
+                      for m in page.get('DeleteMarkers', [])
+                  ]
+                  if to_delete:
+                      s3.delete_objects(Bucket=bucket,
+                                        Delete={'Objects': to_delete, 'Quiet': True})
+                      total += len(to_delete)
+
+              print(f'{bucket}: purged {total} objects/markers')
+              s3.delete_bucket(Bucket=bucket)
+              print(f'{bucket}: deleted')
+          PYEOF
+
+      # ── 7. Secrets Manager / ECR / IAM / SSM ────────────────────────────────
+      - name: Delete Secrets Manager secrets
+        run: |
+          for SECRET in \
+            "nextgen-databridge/connections/audit_db" \
+            "nextgen-databridge/connections/redis" \
+            "nextgen-databridge/connections/wwi_sqlserver" \
+            "nextgen-databridge/connections/wwi_sqlserver_target"; do
+            aws secretsmanager delete-secret \
+              --secret-id "$SECRET" \
+              --force-delete-without-recovery 2>/dev/null \
+              && echo "Deleted: $SECRET" || echo "Not found: $SECRET"
+          done
+
+      - name: Delete ECR repositories
+        run: |
+          for REPO in \
+            "nextgen-databridge/api" \
+            "nextgen-databridge/ui" \
+            "nextgen-databridge/transform"; do
+            aws ecr delete-repository --repository-name "$REPO" --force 2>/dev/null \
+              && echo "Deleted ECR: $REPO" || echo "Not found: $REPO"
+          done
+
+      - name: Delete IAM roles
+        run: |
+          delete_role() {
+            local ROLE=$1
+            for PA in $(aws iam list-attached-role-policies --role-name "$ROLE" \
+                --query 'AttachedPolicies[].PolicyArn' --output text 2>/dev/null); do
+              aws iam detach-role-policy --role-name "$ROLE" --policy-arn "$PA" || true
+            done
+            for IP in $(aws iam list-role-policies --role-name "$ROLE" \
+                --query 'PolicyNames[]' --output text 2>/dev/null); do
+              aws iam delete-role-policy --role-name "$ROLE" --policy-name "$IP" || true
+            done
+            aws iam delete-role --role-name "$ROLE" 2>/dev/null \
+              && echo "Deleted role: $ROLE" || echo "Not found: $ROLE"
+          }
+          delete_role "nextgen-databridge-mwaa"
+          delete_role "nextgen-databridge-rds-s3-restore"
+          delete_role "nextgen-databridge-task-runner"
+
+      - name: Delete SSM parameters
+        run: |
+          aws ssm delete-parameters \
+            --names "/nextgen-databridge/image-tag/${{ inputs.environment }}" \
+            2>/dev/null || true
+
+      # ── 8. Delete RDS/ElastiCache supporting resources ───────────────────────
+      - name: Delete RDS subnet groups, option groups, ElastiCache subnet group
+        run: |
+          for SG in "nextgen-databridge-postgres" "nextgen-databridge-sqlserver"; do
+            aws rds delete-db-subnet-group --db-subnet-group-name "$SG" 2>/dev/null \
+              && echo "Deleted DB subnet group: $SG" || echo "Not found: $SG"
+          done
+          aws rds delete-option-group \
+            --option-group-name "nextgen-databridge-sqlserver" 2>/dev/null \
+            && echo "Deleted SQL Server option group." || echo "Not found."
+          aws elasticache delete-subnet-group \
+            --cache-subnet-group-name "nextgen-databridge-redis" 2>/dev/null \
+            && echo "Deleted ElastiCache subnet group." || echo "Not found."
+
+      - name: Delete security groups
+        run: |
+          for SG_NAME in \
+            "nextgen-databridge-rds" \
+            "nextgen-databridge-postgres" \
+            "nextgen-databridge-sqlserver" \
+            "nextgen-databridge-mwaa"; do
+            SG_ID=$(aws ec2 describe-security-groups \
+              --filters "Name=group-name,Values=${SG_NAME}" \
+              --query 'SecurityGroups[0].GroupId' --output text 2>/dev/null)
+            [[ -z "$SG_ID" || "$SG_ID" == "None" ]] && echo "Not found: $SG_NAME" && continue
+            # Revoke all rules to clear cross-SG references
+            INGRESS=$(aws ec2 describe-security-groups --group-ids "$SG_ID" \
+              --query 'SecurityGroups[0].IpPermissions' --output json 2>/dev/null)
+            [[ "$INGRESS" != "[]" && -n "$INGRESS" ]] && \
+              aws ec2 revoke-security-group-ingress \
+                --group-id "$SG_ID" --ip-permissions "$INGRESS" 2>/dev/null || true
+            aws ec2 delete-security-group --group-id "$SG_ID" 2>/dev/null \
+              && echo "Deleted SG: $SG_NAME ($SG_ID)" \
+              || echo "Could not delete SG: $SG_NAME — may still have attached ENIs"
+          done
+
+      # ── 9. VPC teardown ──────────────────────────────────────────────────────
+      # Order matters:
+      #   a) NAT gateways (hold EIPs)
+      #   b) EIPs — disassociate ALL then release ALL (associated ones block IGW detach)
+      #   c) IGW detach + delete
+      #   d) Remaining ENIs (from EKS, MWAA, RDS that weren't cleaned up above)
+      #   e) Subnets
+      #   f) Route tables (non-main)
+      #   g) VPC
+      - name: Delete VPC and networking
+        run: |
+          VPC_ID=$(aws ec2 describe-vpcs \
+            --filters "Name=tag:Name,Values=nextgen-databridge-vpc" \
+            --query 'Vpcs[0].VpcId' --output text 2>/dev/null)
+          if [[ -z "$VPC_ID" || "$VPC_ID" == "None" ]]; then
+            echo "VPC not found — already deleted."
+            exit 0
+          fi
+          echo "VPC: $VPC_ID"
+
+          # a) NAT gateways
+          for NGW in $(aws ec2 describe-nat-gateways \
+              --filter "Name=vpc-id,Values=$VPC_ID" \
+                       "Name=state,Values=available,pending" \
+              --query 'NatGateways[].NatGatewayId' --output text 2>/dev/null); do
+            echo "Deleting NAT gateway: $NGW"
+            aws ec2 delete-nat-gateway --nat-gateway-id "$NGW"
+          done
+          # Wait for NAT GW to fully release (they hold the EIPs)
+          echo "Waiting 90s for NAT gateways to release..."
+          sleep 90
+
+          # b) Disassociate + release ALL Elastic IPs in this VPC
+          #    (associated EIPs block IGW detach with "mapped public address" error)
+          for ASSOC_ID in $(aws ec2 describe-addresses \
+              --filters "Name=domain,Values=vpc" \
+              --query 'Addresses[?AssociationId!=null].AssociationId' \
+              --output text 2>/dev/null); do
+            aws ec2 disassociate-address --association-id "$ASSOC_ID" 2>/dev/null \
+              && echo "Disassociated EIP association: $ASSOC_ID" || true
+          done
+          for ALLOC_ID in $(aws ec2 describe-addresses \
+              --filters "Name=domain,Values=vpc" \
+              --query 'Addresses[].AllocationId' \
+              --output text 2>/dev/null); do
+            aws ec2 release-address --allocation-id "$ALLOC_ID" 2>/dev/null \
+              && echo "Released EIP: $ALLOC_ID" || true
+          done
+
+          # c) Internet gateway
+          for IGW in $(aws ec2 describe-internet-gateways \
+              --filters "Name=attachment.vpc-id,Values=$VPC_ID" \
+              --query 'InternetGateways[].InternetGatewayId' --output text 2>/dev/null); do
+            aws ec2 detach-internet-gateway \
+              --internet-gateway-id "$IGW" --vpc-id "$VPC_ID" 2>/dev/null \
+              && echo "Detached IGW: $IGW" || echo "Could not detach IGW: $IGW"
+            aws ec2 delete-internet-gateway --internet-gateway-id "$IGW" 2>/dev/null \
+              && echo "Deleted IGW: $IGW" || true
+          done
+
+          # d) Remaining ENIs (EKS/MWAA/RDS ENIs that were left behind)
+          #    Only try to delete "available" ones; "in-use" means a service is still holding them.
+          for ENI in $(aws ec2 describe-network-interfaces \
+              --filters "Name=vpc-id,Values=$VPC_ID" \
+                        "Name=status,Values=available" \
+              --query 'NetworkInterfaces[].NetworkInterfaceId' \
+              --output text 2>/dev/null); do
+            aws ec2 delete-network-interface --network-interface-id "$ENI" 2>/dev/null \
+              && echo "Deleted ENI: $ENI" || echo "Could not delete ENI: $ENI"
+          done
+          # Log any remaining in-use ENIs so the user knows what's blocking
+          IN_USE=$(aws ec2 describe-network-interfaces \
+            --filters "Name=vpc-id,Values=$VPC_ID" "Name=status,Values=in-use" \
+            --query 'NetworkInterfaces[].[NetworkInterfaceId,Description,InterfaceType]' \
+            --output text 2>/dev/null)
+          if [[ -n "$IN_USE" ]]; then
+            echo "WARNING: in-use ENIs still present (these must be released by the owning service):"
+            echo "$IN_USE"
+            echo "Waiting 60s for services to release them..."
+            sleep 60
+            # Retry available ENIs after waiting
+            for ENI in $(aws ec2 describe-network-interfaces \
+                --filters "Name=vpc-id,Values=$VPC_ID" "Name=status,Values=available" \
+                --query 'NetworkInterfaces[].NetworkInterfaceId' --output text 2>/dev/null); do
+              aws ec2 delete-network-interface --network-interface-id "$ENI" 2>/dev/null \
+                && echo "Deleted ENI: $ENI" || true
+            done
+          fi
+
+          # e) Subnets
+          for SUBNET in $(aws ec2 describe-subnets \
+              --filters "Name=vpc-id,Values=$VPC_ID" \
+              --query 'Subnets[].SubnetId' --output text 2>/dev/null); do
+            aws ec2 delete-subnet --subnet-id "$SUBNET" 2>/dev/null \
+              && echo "Deleted subnet: $SUBNET" \
+              || echo "Could not delete subnet: $SUBNET (dependencies remain)"
+          done
+
+          # f) Route tables (non-main)
+          for RT in $(aws ec2 describe-route-tables \
+              --filters "Name=vpc-id,Values=$VPC_ID" \
+              --query 'RouteTables[?length(Associations[?Main==`true`])==`0`].RouteTableId' \
+              --output text 2>/dev/null); do
+            for ASSOC in $(aws ec2 describe-route-tables --route-table-ids "$RT" \
+                --query 'RouteTables[0].Associations[].RouteTableAssociationId' \
+                --output text 2>/dev/null); do
+              aws ec2 disassociate-route-table --association-id "$ASSOC" 2>/dev/null || true
+            done
+            aws ec2 delete-route-table --route-table-id "$RT" 2>/dev/null \
+              && echo "Deleted route table: $RT" || true
+          done
+
+          # g) VPC
+          aws ec2 delete-vpc --vpc-id "$VPC_ID" 2>/dev/null \
+            && echo "VPC $VPC_ID deleted." \
+            || {
+              echo ""
+              echo "VPC $VPC_ID could not be deleted. Remaining dependencies:"
+              aws ec2 describe-network-interfaces \
+                --filters "Name=vpc-id,Values=$VPC_ID" \
+                --query 'NetworkInterfaces[].[NetworkInterfaceId,Status,Description,InterfaceType]' \
+                --output table 2>/dev/null || true
+              echo ""
+              echo "Re-run this workflow to retry, or remove the above ENIs manually from the EC2 console."
+            }
+
+      # ── Summary ──────────────────────────────────────────────────────────────
+      - name: Write summary
+        if: always()
+        run: |
+          {
+            echo "## Emergency Cleanup — ${{ inputs.environment }}"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Environment | \`${{ inputs.environment }}\` |"
+            echo "| Actor | @${{ github.actor }} |"
+            echo "| Run | [${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) |"
+            echo ""
+            echo "> If any steps failed, re-running the workflow is safe — all steps are idempotent."
+            echo "> A VPC that still won't delete means in-use ENIs remain; check the EC2 → Network Interfaces console."
+          } >> "$GITHUB_STEP_SUMMARY"
