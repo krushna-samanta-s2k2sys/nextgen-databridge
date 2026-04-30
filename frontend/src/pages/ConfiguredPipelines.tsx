@@ -297,7 +297,7 @@ function PipelineDetail({ pipelineId }: { pipelineId: string }) {
       {/* JSON Config Modal */}
       {showJson && (
         <div className="fixed inset-0 z-50 flex items-center justify-center p-6 bg-black/50">
-          <div className="bg-white rounded-2xl shadow-2xl w-full max-w-4xl max-h-[85vh] flex flex-col">
+          <div className="bg-white rounded-2xl shadow-2xl w-full max-w-4xl">
             <div className="flex items-center justify-between px-5 py-4 border-b border-gray-200">
               <div className="flex items-center gap-2">
                 <FileJson size={15} className="text-blue-600" />
@@ -311,9 +311,9 @@ function PipelineDetail({ pipelineId }: { pipelineId: string }) {
                 <X size={16} />
               </button>
             </div>
-            <div className="flex-1 overflow-hidden rounded-b-2xl">
+            <div className="overflow-hidden rounded-b-2xl">
               <Editor
-                height="100%"
+                height="calc(85vh - 72px)"
                 language="json"
                 theme="vs-dark"
                 value={JSON.stringify(cfg, null, 2)}
