@@ -1,0 +1,140 @@
+{
+  "pipeline_id": "wwi_external_actions_etl",
+  "version": "1.0.0",
+  "description": "WWI external actions demo: fetch exchange rates via API, trigger an Autosys pre-processing job, execute stored procedures for daily summaries, post a completion webhook.",
+  "schedule": "0 7 * * *",
+  "retries": 2,
+  "retry_delay_minutes": 10,
+  "retry_exponential_backoff": true,
+  "sla_minutes": 90,
+  "max_active_runs": 1,
+  "catchup": false,
+  "dag_timeout_minutes": 180,
+  "owner": "data-engineering",
+  "team": "analytics",
+  "tags": ["wwi", "external", "api", "autosys", "stored-proc"],
+  "alerting": {
+    "on_failure": ["slack:#data-alerts", "email:data-eng@company.com"],
+    "on_sla_breach": ["slack:#data-alerts"],
+    "on_success": ["slack:#data-notifications"]
+  },
+
+  "tasks": [
+    {
+      "task_id": "fetch_exchange_rates",
+      "type": "api_call",
+      "url": "https://api.exchangerate.internal/v2/rates?base=USD&date={{ ds }}",
+      "method": "GET",
+      "auth": {
+        "type": "api_key",
+        "key": "X-Api-Key",
+        "value": "secret:nextgen-databridge/connections/exchange_rate_api/api_key",
+        "in": "header"
+      },
+      "assert_status": [200],
+      "retry_on_status": [429, 503],
+      "timeout_seconds": 30,
+      "response_xcom_key": "exchange_rates"
+    },
+
+    {
+      "task_id": "trigger_autosys_staging",
+      "type": "autosys_job",
+      "depends_on": ["fetch_exchange_rates"],
+      "autosys_url": "https://autosys.corp.internal:9443",
+      "job_name": "WWI_DAILY_STAGE_LOAD",
+      "auth": {
+        "type": "autosys_token",
+        "username": "svc-databridge",
+        "password": "secret:nextgen-databridge/connections/autosys/password"
+      },
+      "job_params": {
+        "PROCESS_DATE": "{{ ds }}",
+        "SOURCE_SYSTEM": "WWI"
+      },
+      "wait_for_completion": true,
+      "poll_interval_seconds": 30,
+      "timeout_seconds": 1800
+    },
+
+    {
+      "task_id": "proc_daily_sales_summary",
+      "type": "stored_proc",
+      "depends_on": ["trigger_autosys_staging"],
+      "connection": "wwi_sqlserver",
+      "procedure": "Sales.usp_GenerateDailySalesSummary",
+      "parameters": [
+        {"name": "ProcessDate",   "value": "{{ ds }}",    "direction": "in"},
+        {"name": "CurrencyCode",  "value": "USD",         "direction": "in"},
+        {"name": "RowsInserted",  "value": null,          "direction": "out"},
+        {"name": "ErrorMessage",  "value": null,          "direction": "out"}
+      ],
+      "capture_resultset": true,
+      "output": {
+        "duckdb_path": "s3://${duckdb_store}/pipelines/wwi_external_actions_etl/runs/{{ run_id }}/daily_sales_summary.duckdb",
+        "table": "daily_sales_summary"
+      }
+    },
+
+    {
+      "task_id": "proc_update_inventory_levels",
+      "type": "stored_proc",
+      "depends_on": ["trigger_autosys_staging"],
+      "connection": "wwi_sqlserver",
+      "procedure": "Warehouse.usp_RecalculateStockLevels",
+      "parameters": [
+        {"name": "AsOfDate",      "value": "{{ ds }}",    "direction": "in"},
+        {"name": "StockItemCount","value": null,          "direction": "out"}
+      ],
+      "capture_resultset": false
+    },
+
+    {
+      "task_id": "validate_sales_summary",
+      "type": "data_quality",
+      "depends_on": ["proc_daily_sales_summary"],
+      "source": {
+        "duckdb_path": "s3://${duckdb_store}/pipelines/wwi_external_actions_etl/runs/{{ run_id }}/daily_sales_summary.duckdb",
+        "table": "daily_sales_summary"
+      },
+      "checks": [
+        {"type": "not_null",      "column": "OrderDate",    "action": "fail"},
+        {"type": "not_null",      "column": "TotalSales",   "action": "fail"},
+        {"type": "row_count_min", "value": 1,               "action": "warn"},
+        {"type": "value_range",   "column": "TotalSales",   "min": 0, "action": "fail"}
+      ]
+    },
+
+    {
+      "task_id": "call_downstream_api",
+      "type": "api_call",
+      "depends_on": ["validate_sales_summary", "proc_update_inventory_levels"],
+      "url": "https://downstream.corp.internal/api/v1/etl/complete",
+      "method": "POST",
+      "auth": {
+        "type": "oauth2_client_credentials",
+        "token_url": "https://auth.corp.internal/oauth2/token",
+        "client_id": "nextgen-databridge",
+        "client_secret": "secret:nextgen-databridge/connections/downstream_api/client_secret",
+        "scope": "etl:notify"
+      },
+      "body": {
+        "pipeline_id": "wwi_external_actions_etl",
+        "run_id": "{{ run_id }}",
+        "process_date": "{{ ds }}",
+        "status": "completed"
+      },
+      "assert_status": [200, 201, 202],
+      "timeout_seconds": 15
+    },
+
+    {
+      "task_id": "notify_completion",
+      "type": "notification",
+      "depends_on": ["call_downstream_api"],
+      "channels": ["slack:#data-notifications"],
+      "subject": "WWI External Actions ETL completed for {{ ds }}",
+      "message": "Daily sales summary and inventory update completed. Run: {{ run_id }}"
+    }
+  ]
+}

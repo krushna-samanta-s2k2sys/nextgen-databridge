@@ -13,7 +13,8 @@ VALID_TASK_TYPES = {
     "sql_extract", "sql_transform", "duckdb_transform", "duckdb_query",
     "schema_validate", "data_quality", "cdc_extract", "file_ingest",
     "kafka_consume", "kafka_produce", "pubsub_consume", "pubsub_publish",
-    "eks_job", "python_callable", "conditional_branch", "load_target", "notification"
+    "eks_job", "python_callable", "conditional_branch", "load_target", "notification",
+    "api_call", "autosys_job", "stored_proc",
 }
 
 VALID_QC_CHECKS = {
@@ -189,9 +190,18 @@ class PipelineConfigValidator:
             self._validate_kafka_task(task, result)
         elif task_type == "conditional_branch":
             self._validate_branch_task(task, result)
+        elif task_type == "api_call":
+            self._validate_api_call_task(task, result)
+        elif task_type == "autosys_job":
+            self._validate_autosys_task(task, result)
+        elif task_type == "stored_proc":
+            self._validate_stored_proc_task(task, result)
 
-        # output is required for most tasks (not validation/notification)
-        non_output_types = {"schema_validate", "data_quality", "notification", "conditional_branch"}
+        # output is required for most tasks (not validation/notification/trigger tasks)
+        non_output_types = {
+            "schema_validate", "data_quality", "notification", "conditional_branch",
+            "api_call", "autosys_job",
+        }
         if task_type not in non_output_types:
             output = task.get("output", {})
             if not output.get("duckdb_path") and not output.get("target"):
@@ -263,6 +273,74 @@ class PipelineConfigValidator:
                 result.warn(
                     f"Task '{task_id}' branch '{b.get('label', '?')}' has no condition"
                 )
+
+    def _validate_api_call_task(self, task: dict, result: ValidationResult):
+        task_id = task["task_id"]
+        if not task.get("url"):
+            result.error(f"Task '{task_id}' (api_call) must have 'url'")
+        method = task.get("method", "GET").upper()
+        if method not in ("GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"):
+            result.error(f"Task '{task_id}' (api_call) invalid method '{method}'")
+        auth = task.get("auth") or {}
+        auth_type = auth.get("type", "none")
+        if auth_type not in ("none", "basic", "bearer", "api_key",
+                             "oauth2_client_credentials"):
+            result.error(
+                f"Task '{task_id}' (api_call) unknown auth.type '{auth_type}'"
+            )
+        if auth_type == "basic" and (not auth.get("username") or not auth.get("password")):
+            result.error(f"Task '{task_id}' (api_call) basic auth requires username and password")
+        if auth_type == "bearer" and not auth.get("token"):
+            result.error(f"Task '{task_id}' (api_call) bearer auth requires token")
+        if auth_type == "api_key" and (not auth.get("key") or not auth.get("value")):
+            result.error(f"Task '{task_id}' (api_call) api_key auth requires key and value")
+        if auth_type == "oauth2_client_credentials":
+            for field in ("token_url", "client_id", "client_secret"):
+                if not auth.get(field):
+                    result.error(
+                        f"Task '{task_id}' (api_call) oauth2_client_credentials requires '{field}'"
+                    )
+
+    def _validate_autosys_task(self, task: dict, result: ValidationResult):
+        task_id = task["task_id"]
+        if not task.get("autosys_url"):
+            result.error(f"Task '{task_id}' (autosys_job) must have 'autosys_url'")
+        if not task.get("job_name"):
+            result.error(f"Task '{task_id}' (autosys_job) must have 'job_name'")
+        auth = task.get("auth") or {}
+        auth_type = auth.get("type", "none")
+        if auth_type not in ("none", "basic", "bearer", "autosys_token"):
+            result.error(
+                f"Task '{task_id}' (autosys_job) unknown auth.type '{auth_type}'"
+            )
+        if auth_type == "autosys_token" and (not auth.get("username") or not auth.get("password")):
+            result.error(
+                f"Task '{task_id}' (autosys_job) autosys_token auth requires username and password"
+            )
+        timeout = task.get("timeout_seconds")
+        if timeout is not None and (not isinstance(timeout, int) or timeout <= 0):
+            result.error(f"Task '{task_id}' (autosys_job) timeout_seconds must be a positive int")
+
+    def _validate_stored_proc_task(self, task: dict, result: ValidationResult):
+        task_id = task["task_id"]
+        if not task.get("connection"):
+            result.error(f"Task '{task_id}' (stored_proc) must have 'connection'")
+        if not task.get("procedure"):
+            result.error(f"Task '{task_id}' (stored_proc) must have 'procedure'")
+        for param in task.get("parameters") or []:
+            if not param.get("name"):
+                result.error(f"Task '{task_id}' (stored_proc) parameter missing 'name'")
+            direction = param.get("direction", "in")
+            if direction not in ("in", "out", "inout"):
+                result.error(
+                    f"Task '{task_id}' (stored_proc) parameter '{param.get('name')}' "
+                    f"direction must be in/out/inout"
+                )
+        if task.get("capture_resultset") and not (task.get("output") or {}).get("duckdb_path"):
+            result.warn(
+                f"Task '{task_id}' (stored_proc) has capture_resultset=true "
+                "but no output.duckdb_path defined"
+            )
 
     def _check_dag_acyclic(self, tasks: List[dict], result: ValidationResult):
         """Topological sort (Kahn's algorithm) to detect cycles"""
