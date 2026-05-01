@@ -71,7 +71,6 @@
       ],
       "capture_resultset": true,
       "output": {
-        "duckdb_path": "s3://${duckdb_store}/pipelines/wwi_external_actions_etl/runs/{{ run_id }}/daily_sales_summary.duckdb",
         "table": "daily_sales_summary"
       }
     },
@@ -94,7 +93,6 @@
       "type": "data_quality",
       "depends_on": ["proc_daily_sales_summary"],
       "source": {
-        "duckdb_path": "s3://${duckdb_store}/pipelines/wwi_external_actions_etl/runs/{{ run_id }}/daily_sales_summary.duckdb",
         "table": "daily_sales_summary"
       },
       "checks": [
