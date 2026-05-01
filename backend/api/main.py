@@ -821,9 +821,26 @@ async def get_run(
             logger.warning(f"Airflow state sync failed for run {run_id}: {exc}")
 
     tasks_result = await db.execute(
-        select(TaskRun).where(TaskRun.run_id == run_id).order_by(TaskRun.created_at)
+        select(TaskRun)
+        .where(TaskRun.run_id == run_id)
+        .order_by(TaskRun.start_time.asc().nullslast(), TaskRun.created_at)
     )
-    tasks = tasks_result.scalars().all()
+    tasks = list(tasks_result.scalars().all())
+
+    # Re-sort by the pipeline config's task definition order so the UI shows
+    # tasks in data-flow sequence (source → transform → load) rather than
+    # insertion order, which can be arbitrary when tasks start close together.
+    cfg_res = await db.execute(
+        select(PipelineConfig)
+        .where(PipelineConfig.pipeline_id == run.pipeline_id, PipelineConfig.is_active == True)
+    )
+    pipeline_cfg = cfg_res.scalar_one_or_none()
+    if pipeline_cfg and pipeline_cfg.config:
+        cfg_task_order = {
+            t.get("task_id", ""): i
+            for i, t in enumerate(pipeline_cfg.config.get("tasks", []))
+        }
+        tasks.sort(key=lambda t: cfg_task_order.get(t.task_id, len(cfg_task_order)))
 
     return {
         "run_id": run.run_id,
