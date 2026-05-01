@@ -292,6 +292,30 @@ def _mark_task_run_failed(
                 WHERE run_id = %s
             """, (run_id,))
 
+            # Check whether all tasks have now completed and mark the run done.
+            # This is the fallback path for when dag_run_failure_callback does
+            # not fire (e.g. MWAA manual-fail from UI in some Airflow versions).
+            cur.execute("""
+                SELECT total_tasks,
+                       COALESCE(completed_tasks, 0),
+                       COALESCE(failed_tasks, 0)
+                FROM pipeline_runs WHERE run_id = %s
+            """, (run_id,))
+            row = cur.fetchone()
+            if row:
+                total_t, completed_t, failed_t = row
+                if total_t > 0 and (completed_t + failed_t) >= total_t:
+                    cur.execute("""
+                        UPDATE pipeline_runs
+                        SET status           = CAST('failed' AS runstatus),
+                            end_time         = COALESCE(end_time, NOW()),
+                            duration_seconds = COALESCE(
+                                duration_seconds,
+                                EXTRACT(EPOCH FROM (NOW() - start_time))
+                            )
+                        WHERE run_id = %s AND status = 'running'
+                    """, (run_id,))
+
         conn.commit()
         cur.close()
         conn.close()
@@ -387,25 +411,33 @@ def dag_run_success_callback(context: dict):
     """Called by Airflow when a full DAG run completes successfully"""
     dag     = context.get("dag")
     dag_run = context.get("dag_run")
-    if not dag or not dag_run:
+
+    dag_id = (
+        (dag.dag_id     if dag     else None) or
+        (dag_run.dag_id if dag_run else None) or
+        context.get("dag_id", "")
+    )
+    run_id = (
+        (dag_run.run_id if dag_run else None) or
+        context.get("run_id", "")
+    )
+    if not dag_id or not run_id:
+        logger.warning("dag_run_success_callback: missing dag_id or run_id in context")
         return
 
-    dag_id = dag.dag_id
-    run_id = dag_run.run_id
-
     try:
-        tis       = dag_run.get_task_instances()
+        tis       = dag_run.get_task_instances() if dag_run else []
         total     = len(tis)
         completed = sum(1 for ti in tis if getattr(ti, "state", "") == "success")
         failed    = sum(1 for ti in tis if getattr(ti, "state", "") in ("failed", "upstream_failed"))
     except Exception:
         total = completed = failed = 0
 
-    start = dag_run.start_date
-    end   = dag_run.end_date or datetime.now(timezone.utc)
+    start = getattr(dag_run, "start_date", None) if dag_run else None
+    end   = (getattr(dag_run, "end_date", None) if dag_run else None) or datetime.now(timezone.utc)
     dur   = (end - start).total_seconds() if start and end else None
 
-    run_type = getattr(dag_run, "run_type", None)
+    run_type     = getattr(dag_run, "run_type", None) if dag_run else None
     trigger_type = "manual" if run_type and "manual" in str(run_type).lower() else "scheduled"
 
     _upsert_pipeline_run(
@@ -428,26 +460,35 @@ def dag_run_failure_callback(context: dict):
     """Called by Airflow when a DAG run fails"""
     dag     = context.get("dag")
     dag_run = context.get("dag_run")
-    if not dag or not dag_run:
+
+    dag_id = (
+        (dag.dag_id     if dag     else None) or
+        (dag_run.dag_id if dag_run else None) or
+        context.get("dag_id", "")
+    )
+    run_id = (
+        (dag_run.run_id if dag_run else None) or
+        context.get("run_id", "")
+    )
+    if not dag_id or not run_id:
+        logger.warning("dag_run_failure_callback: missing dag_id or run_id in context")
         return
 
-    dag_id  = dag.dag_id
-    run_id  = dag_run.run_id
     reason  = str(context.get("reason", ""))
 
     try:
-        tis       = dag_run.get_task_instances()
+        tis       = dag_run.get_task_instances() if dag_run else []
         total     = len(tis)
         failed    = sum(1 for ti in tis if getattr(ti, "state", "") in ("failed", "upstream_failed"))
         completed = sum(1 for ti in tis if getattr(ti, "state", "") == "success")
     except Exception:
         total = completed = failed = 0
 
-    start = dag_run.start_date
-    end   = dag_run.end_date or datetime.now(timezone.utc)
+    start = getattr(dag_run, "start_date", None) if dag_run else None
+    end   = (getattr(dag_run, "end_date", None) if dag_run else None) or datetime.now(timezone.utc)
     dur   = (end - start).total_seconds() if start and end else None
 
-    run_type = getattr(dag_run, "run_type", None)
+    run_type     = getattr(dag_run, "run_type", None) if dag_run else None
     trigger_type = "manual" if run_type and "manual" in str(run_type).lower() else "scheduled"
 
     _upsert_pipeline_run(
