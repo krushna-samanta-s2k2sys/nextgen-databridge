@@ -237,6 +237,68 @@ def _fire_pipeline_alerts(pipeline_config: dict, event: str, context: dict):
             logger.info(f"PagerDuty alert would fire for key {pd_key[:8]}...")
 
 
+def _mark_task_run_failed(
+    run_id: str, dag_id: str, task_id: str, attempt: int,
+    err_msg: str, end_time: Optional[datetime] = None,
+):
+    """
+    Ensure task_runs reflects a failure.  Called from on_failure_callback so
+    that tasks manually marked failed from the Airflow UI — where the operator's
+    except block never executes — are still recorded correctly.
+
+    Uses a conditional UPDATE so pipeline_runs.failed_tasks is only incremented
+    when the row was not already in 'failed' state, preventing double-counting
+    when the operator's own except block already wrote the failure.
+    """
+    try:
+        conn        = _audit_db_conn()
+        cur         = conn.cursor()
+        task_run_id = f"{run_id}_{task_id}_attempt{attempt}"
+        _end        = end_time or datetime.now(timezone.utc)
+
+        # Update only if the record exists and is not already failed.
+        cur.execute("""
+            UPDATE task_runs
+            SET status        = 'failed',
+                end_time      = COALESCE(end_time, %s),
+                error_message = COALESCE(error_message, %s),
+                updated_at    = NOW()
+            WHERE task_run_id = %s
+              AND status != 'failed'
+        """, (_end, err_msg[:2000] if err_msg else None, task_run_id))
+
+        newly_failed = cur.rowcount
+
+        if newly_failed == 0:
+            # Record may not exist yet (task was manually failed before it ever ran).
+            cur.execute("""
+                INSERT INTO task_runs
+                    (id, task_run_id, run_id, pipeline_id, task_id, status,
+                     end_time, error_message, created_at, updated_at)
+                VALUES (%s, %s, %s, %s, %s, 'failed', %s, %s, NOW(), NOW())
+                ON CONFLICT (task_run_id) DO NOTHING
+            """, (
+                str(uuid.uuid4()), task_run_id, run_id, dag_id, task_id,
+                _end, err_msg[:2000] if err_msg else None,
+            ))
+            newly_failed = cur.rowcount
+
+        # Only bump the pipeline_runs counter when this callback is the first
+        # to record the failure (avoids double-counting with operator writes).
+        if newly_failed > 0:
+            cur.execute("""
+                UPDATE pipeline_runs
+                SET failed_tasks = COALESCE(failed_tasks, 0) + 1
+                WHERE run_id = %s
+            """, (run_id,))
+
+        conn.commit()
+        cur.close()
+        conn.close()
+    except Exception as e:
+        logger.error(f"Failed to mark task_run as failed: {e}")
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Airflow Callback Functions
 # ─────────────────────────────────────────────────────────────────────────────
@@ -249,14 +311,22 @@ def on_failure_callback(context: dict):
     run_id      = context.get("run_id", "")
     exception   = context.get("exception", "Unknown error")
     err_msg     = str(exception)
+    attempt     = ti.try_number if ti else 1
 
     logger.error(f"Task FAILED: {dag_id}/{task_id} — {err_msg[:200]}")
 
     _ensure_run_started(dag_id, run_id, start_time=ti.start_date if ti else None)
 
+    # Ensure task_runs reflects the failure regardless of whether the operator's
+    # except block ran (handles manual failures from the Airflow UI).
+    _mark_task_run_failed(
+        run_id=run_id, dag_id=dag_id, task_id=task_id, attempt=attempt,
+        err_msg=err_msg, end_time=ti.end_date if ti else None,
+    )
+
     _write_audit_log(
         "TASK_FAILED", dag_id, run_id, task_id,
-        {"error": err_msg[:2000], "attempt": ti.try_number if ti else 1},
+        {"error": err_msg[:2000], "attempt": attempt},
         severity="error",
     )
 
@@ -268,7 +338,7 @@ def on_failure_callback(context: dict):
         pipeline_id=dag_id,
         run_id=run_id,
         task_id=task_id,
-        details={"error": err_msg[:2000], "attempt": ti.try_number if ti else 1},
+        details={"error": err_msg[:2000], "attempt": attempt},
     )
 
     # Fire pipeline-level alerts
