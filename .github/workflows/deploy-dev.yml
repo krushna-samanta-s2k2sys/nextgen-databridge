@@ -448,11 +448,11 @@ jobs:
           fi
           for f in configs/pipelines/*.json; do
             PIPELINE_ID=$(jq -r '.pipeline_id' "$f")
-            STATUS=$(curl -sf -o /dev/null -w "%{http_code}" -X PATCH \
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" -X PATCH \
               "https://${MWAA_HOST}/api/v1/dags/${PIPELINE_ID}" \
               -H "Authorization: Bearer ${TOKEN}" \
               -H "Content-Type: application/json" \
-              -d '{"is_paused": false}')
+              -d '{"is_paused": false}' || echo "000")
             if [[ "$STATUS" =~ ^2 ]]; then
               echo "  ✓ Unpaused ${PIPELINE_ID}"
             else
