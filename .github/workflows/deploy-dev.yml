@@ -462,6 +462,7 @@ jobs:
 
       - name: Sync historical MWAA runs to PostgreSQL
         run: |
+          set -euo pipefail
           pip install psycopg2-binary --quiet 2>/dev/null
 
           MWAA_HOST=$(aws mwaa get-environment --name "nextgen-databridge" \
@@ -479,6 +480,26 @@ jobs:
           fi
 
           PIPELINE_IDS=$(for f in configs/pipelines/*.json; do jq '.pipeline_id' "$f"; done | jq -sc '.')
+
+          # The RDS security group only allows VPC CIDR by default.
+          # Temporarily open port 5432 to this runner and remove the rule on exit,
+          # matching the same pattern used in infra-audit-db.yml.
+          RUNNER_IP=$(curl -sf https://checkip.amazonaws.com)
+          RUNNER_CIDR="${RUNNER_IP}/32"
+          SG_ID=$(aws ec2 describe-security-groups \
+            --filters "Name=group-name,Values=nextgen-databridge-postgres" \
+            --query 'SecurityGroups[0].GroupId' --output text)
+
+          cleanup() {
+            aws ec2 revoke-security-group-ingress \
+              --group-id "$SG_ID" --protocol tcp --port 5432 \
+              --cidr "$RUNNER_CIDR" 2>/dev/null || true
+          }
+          trap cleanup EXIT
+
+          aws ec2 authorize-security-group-ingress \
+            --group-id "$SG_ID" --protocol tcp --port 5432 --cidr "$RUNNER_CIDR" \
+            --tag-specifications "ResourceType=security-group-rule,Tags=[{Key=ci-runner,Value=true}]"
 
           MWAA_HOST="$MWAA_HOST" MWAA_TOKEN="$TOKEN" DB_URL="$DB_URL" \
             PIPELINE_IDS="$PIPELINE_IDS" python3 scripts/sync_mwaa_runs.py
