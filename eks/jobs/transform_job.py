@@ -107,9 +107,23 @@ def upload_duckdb(local_path: str, s3_path: str):
 # ─── Audit DB helper ──────────────────────────────────────────────────────────
 
 def write_task_run(status: str, **fields):
-    url = os.getenv("AUDIT_DB_URL", "").replace("postgresql+asyncpg://", "postgresql://")
-    if not url:
+    raw = os.getenv("AUDIT_DB_URL", "") or os.getenv("NEXTGEN_DATABRIDGE_AUDIT_DB_URL", "")
+    if not raw:
+        try:
+            _sm = boto3.client(
+                "secretsmanager",
+                region_name=os.getenv("AWS_DEFAULT_REGION", "us-east-1"),
+            )
+            _secret = _sm.get_secret_value(
+                SecretId="nextgen-databridge/connections/audit_db"
+            )
+            raw = json.loads(_secret["SecretString"]).get("url", "")
+        except Exception as _e:
+            logger.warning(f"Audit DB URL not available, skipping task_run write: {_e}")
+            return
+    if not raw:
         return
+    url = raw.replace("postgresql+asyncpg://", "postgresql://")
     try:
         conn = psycopg2.connect(url)
         cur  = conn.cursor()

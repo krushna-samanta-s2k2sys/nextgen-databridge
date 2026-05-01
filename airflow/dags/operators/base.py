@@ -92,8 +92,27 @@ class NextGenDatabridgeBaseOperator(BaseOperator):
 
     # ── Audit DB helpers ───────────────────────────────────────────────────────
     def _audit_db_conn(self):
-        url = self.audit_db_url or os.environ["NEXTGEN_DATABRIDGE_AUDIT_DB_URL"]
-        url = url.replace("postgresql+asyncpg://", "postgresql://")
+        raw = self.audit_db_url or os.getenv("NEXTGEN_DATABRIDGE_AUDIT_DB_URL", "")
+        if not raw:
+            try:
+                import boto3 as _boto3, json as _json
+                _sm = _boto3.client(
+                    "secretsmanager",
+                    region_name=os.getenv("AWS_DEFAULT_REGION", "us-east-1"),
+                )
+                _secret = _sm.get_secret_value(
+                    SecretId="nextgen-databridge/connections/audit_db"
+                )
+                raw = _json.loads(_secret["SecretString"]).get("url", "")
+            except Exception as _e:
+                raise RuntimeError(
+                    f"NEXTGEN_DATABRIDGE_AUDIT_DB_URL not set and Secrets Manager fallback failed: {_e}"
+                )
+        if not raw:
+            raise RuntimeError(
+                "NEXTGEN_DATABRIDGE_AUDIT_DB_URL is not set and secret 'url' field is empty"
+            )
+        url = raw.replace("postgresql+asyncpg://", "postgresql://")
         return psycopg2.connect(url)
 
     def _write_task_run(self, run_id: str, status: str, **fields):
