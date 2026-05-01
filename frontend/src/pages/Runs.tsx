@@ -1,11 +1,11 @@
 import React, { useState } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
-import { useQuery } from '@tanstack/react-query'
-import { getRuns, getRun } from '../api/client'
+import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
+import { getRuns, getRun, syncRun } from '../api/client'
 import { Card, CardHeader, StatusBadge, Spinner, Duration, TimeAgo } from '../components/ui'
 import {
   CheckCircle, XCircle, Database, ChevronRight, ChevronDown,
-  Filter, Activity, Search, ExternalLink,
+  Filter, Activity, Search, ExternalLink, RefreshCw,
 } from 'lucide-react'
 import clsx from 'clsx'
 
@@ -21,8 +21,21 @@ function ErrorBanner({ message }: { message: string }) {
 // ── Runs list page ────────────────────────────────────────────────────────────
 export function Runs() {
   const nav = useNavigate()
+  const queryClient = useQueryClient()
   const [statusFilter, setStatusFilter]     = useState('')
   const [pipelineFilter, setPipelineFilter] = useState('')
+  const [syncingIds, setSyncingIds]         = useState<Set<string>>(new Set())
+
+  async function handleSyncRun(e: React.MouseEvent, runId: string) {
+    e.stopPropagation()
+    setSyncingIds(prev => new Set(prev).add(runId))
+    try {
+      await syncRun(runId)
+      queryClient.invalidateQueries({ queryKey: ['runs'] })
+    } finally {
+      setSyncingIds(prev => { const n = new Set(prev); n.delete(runId); return n })
+    }
+  }
 
   const { data, isLoading, isError, error } = useQuery({
     queryKey: ['runs', statusFilter, pipelineFilter],
@@ -113,6 +126,7 @@ export function Runs() {
                   <th className="px-4 py-3 text-left text-gray-500 font-semibold">Started</th>
                   <th className="px-4 py-3 text-left text-gray-500 font-semibold">Duration</th>
                   <th className="px-4 py-3 text-left text-gray-500 font-semibold">Tasks</th>
+                  <th className="px-4 py-3"></th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-gray-100">
@@ -132,6 +146,17 @@ export function Runs() {
                       <span className="text-gray-400">/{r.total_tasks ?? 0}</span>
                       {r.failed_tasks > 0 && <span className="text-red-500 ml-1">({r.failed_tasks}✗)</span>}
                     </td>
+                    <td className="px-4 py-3" onClick={e => e.stopPropagation()}>
+                      <button
+                        onClick={e => handleSyncRun(e, r.run_id)}
+                        disabled={syncingIds.has(r.run_id)}
+                        title="Refresh from Airflow"
+                        className="flex items-center gap-1 text-xs text-gray-500 hover:text-blue-600 bg-gray-50 hover:bg-blue-50 border border-gray-200 hover:border-blue-200 px-2 py-1 rounded transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                      >
+                        <RefreshCw size={11} className={syncingIds.has(r.run_id) ? 'animate-spin' : ''} />
+                        Refresh
+                      </button>
+                    </td>
                   </tr>
                 ))}
               </tbody>
@@ -147,6 +172,7 @@ export function Runs() {
 export function RunDetail() {
   const { runId } = useParams<{ runId: string }>()
   const nav = useNavigate()
+  const queryClient = useQueryClient()
 
   // Hooks must be at top level — before any conditional returns
   const [expandedItems, setExpandedItems] = useState<Set<string>>(new Set())
@@ -165,6 +191,11 @@ export function RunDetail() {
     refetchInterval: (data: any) =>
       (data?.status === 'running' || data?.tasks?.some((t: any) => t.status === 'running'))
         ? 5_000 : false,
+  })
+
+  const syncMutation = useMutation({
+    mutationFn: () => syncRun(runId!),
+    onSuccess:  () => queryClient.invalidateQueries({ queryKey: ['run', runId] }),
   })
 
   if (isLoading) return <div className="flex justify-center py-20 bg-gray-50 h-full"><Spinner size="lg" /></div>
@@ -212,6 +243,14 @@ export function RunDetail() {
         <div className="flex items-center gap-3 mb-4">
           <h1 className="text-lg font-bold text-gray-900 font-mono">{run.pipeline_id}</h1>
           <StatusBadge status={run.status} />
+          <button
+            onClick={() => syncMutation.mutate()}
+            disabled={syncMutation.isPending}
+            className="ml-auto flex items-center gap-1.5 text-xs text-gray-600 hover:text-blue-600 bg-white hover:bg-blue-50 border border-gray-200 hover:border-blue-300 px-3 py-1.5 rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed shadow-sm"
+          >
+            <RefreshCw size={12} className={syncMutation.isPending ? 'animate-spin' : ''} />
+            Refresh from Airflow
+          </button>
         </div>
         <p className="text-xs text-gray-400 font-mono mb-4 break-all">{runId}</p>
         <div className="grid grid-cols-2 md:grid-cols-3 gap-4">

@@ -828,6 +828,112 @@ async def get_run(
     }
 
 
+@app.post("/api/runs/{run_id}/sync", tags=["Runs"])
+async def sync_run_from_airflow(
+    run_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(maybe_token),
+):
+    """Force-sync pipeline run and task statuses from Airflow, regardless of current DB state."""
+    result = await db.execute(select(PipelineRun).where(PipelineRun.run_id == run_id))
+    run = result.scalar_one_or_none()
+    if not run:
+        raise HTTPException(404, f"Run '{run_id}' not found")
+
+    if not AIRFLOW_URL:
+        raise HTTPException(503, "Airflow integration not configured")
+
+    AF_RUN_MAP: dict = {
+        "success": RunStatus.SUCCESS,
+        "failed":  RunStatus.FAILED,
+        "running": RunStatus.RUNNING,
+        "queued":  RunStatus.QUEUED,
+    }
+    AF_TASK_MAP: dict = {
+        "success":         TaskStatus.SUCCESS,
+        "failed":          TaskStatus.FAILED,
+        "upstream_failed": TaskStatus.UPSTREAM_FAILED,
+        "skipped":         TaskStatus.SKIPPED,
+        "running":         TaskStatus.RUNNING,
+    }
+
+    try:
+        af_run   = await airflow_request("GET", f"/dags/{run.pipeline_id}/dagRuns/{run_id}")
+        af_state = af_run.get("state", "")
+
+        if af_state in AF_RUN_MAP:
+            end_str = af_run.get("end_date")
+            end_dt: Optional[datetime] = None
+            if end_str:
+                try:
+                    end_dt = datetime.fromisoformat(end_str.replace("Z", "+00:00"))
+                except Exception:
+                    pass
+
+            start_str = af_run.get("start_date")
+            run_start: Optional[datetime] = run.start_time
+            if start_str:
+                try:
+                    run_start = datetime.fromisoformat(start_str.replace("Z", "+00:00"))
+                except Exception:
+                    pass
+
+            dur = (end_dt - run_start).total_seconds() if (end_dt and run_start) else run.duration_seconds
+
+            update_vals: dict = {"status": AF_RUN_MAP[af_state]}
+            if end_dt:
+                update_vals["end_time"] = end_dt
+            if dur is not None:
+                update_vals["duration_seconds"] = dur
+
+            await db.execute(
+                update(PipelineRun)
+                .where(PipelineRun.run_id == run_id)
+                .values(**update_vals)
+            )
+
+        # Sync individual task states from Airflow task instances
+        try:
+            af_tasks = await airflow_request(
+                "GET",
+                f"/dags/{run.pipeline_id}/dagRuns/{run_id}/taskInstances",
+            )
+            for ti in af_tasks.get("task_instances", []):
+                ti_state    = ti.get("state", "")
+                ti_task_id  = ti.get("task_id", "")
+                ti_try_num  = ti.get("try_number", 1)
+                task_run_id = f"{run_id}_{ti_task_id}_attempt{ti_try_num}"
+                if ti_state in AF_TASK_MAP:
+                    ti_end_str = ti.get("end_date")
+                    ti_end_dt: Optional[datetime] = None
+                    if ti_end_str:
+                        try:
+                            ti_end_dt = datetime.fromisoformat(ti_end_str.replace("Z", "+00:00"))
+                        except Exception:
+                            pass
+                    task_upd: dict = {"status": AF_TASK_MAP[ti_state]}
+                    if ti_end_dt:
+                        task_upd["end_time"] = ti_end_dt
+                    await db.execute(
+                        update(TaskRun)
+                        .where(TaskRun.task_run_id == task_run_id)
+                        .values(**task_upd)
+                    )
+        except Exception as exc:
+            logger.debug(f"Task instance sync skipped for {run_id}: {exc}")
+
+        await db.commit()
+        await db.refresh(run)
+
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.warning(f"Airflow forced sync failed for run {run_id}: {exc}")
+        raise HTTPException(502, f"Airflow sync failed: {str(exc)}")
+
+    return {"synced": True, "run_id": run_id, "status": run.status.value}
+
+
 @app.post("/api/runs/{run_id}/rerun", tags=["Runs"])
 async def rerun_task(
     run_id: str,
