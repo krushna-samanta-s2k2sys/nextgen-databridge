@@ -304,6 +304,9 @@ Use this for tables with millions–billions of rows where running on an Airflow
 | `conditional_branch` | Airflow worker | Branch pipeline based on evaluated expression |
 | `notification` | Airflow worker | Send Slack / email notifications |
 | `cdc_extract` | Airflow worker | Incremental extract using change tracking |
+| `api_call` | Airflow worker | Call an external REST API and optionally store the response as DuckDB |
+| `autosys_job` | Airflow worker | Trigger and monitor a CA Autosys job, poll until terminal state |
+| `stored_proc` | Airflow worker | Execute a stored procedure on SQL Server / Oracle and optionally capture resultsets |
 
 ### QC check types
 
@@ -365,6 +368,21 @@ RDS instances are publicly accessible from any IP (dev only):
 
 ---
 
+## Monitoring & Admin UI
+
+The React admin UI (`frontend/`) is a **read-only monitoring tool** with four pages:
+
+| Page | URL | Purpose |
+|------|-----|---------|
+| Dashboard | `/` | KPI cards (active runs, success rate, rows processed today), hourly throughput chart, DAG run timeline |
+| Pipeline Runs | `/runs` | Filterable table of all pipeline runs; per-row **Refresh from Airflow** button syncs latest run and task statuses |
+| Run Detail | `/runs/:runId` | Full run summary with task-by-task status, durations, DuckDB output paths, and QC results; **Refresh from Airflow** button force-syncs run and all task statuses from MWAA |
+| Query Explorer | `/query` | Execute ad-hoc SELECT queries against any DuckDB output file stored in S3 |
+
+The UI connects to the FastAPI backend via the Axios client at `frontend/src/api/client.ts`. All write operations (pipeline CRUD, deployments, connections) are performed via the REST API or CI/CD workflows — the UI is intentionally read-only.
+
+---
+
 ## Audit System
 
 Every event is recorded in the `audit_logs` table in PostgreSQL:
@@ -382,6 +400,31 @@ Every `task_runs` record captures:
 - EKS Job name and pod name (for `eks_job` tasks)
 - Duration, attempts, error traceback
 - Worker hostname
+
+---
+
+## REST API
+
+Interactive docs are served by the running backend at `/api/docs` (Swagger UI) and `/api/redoc` (ReDoc).
+
+| Endpoint group | Description |
+|----------------|-------------|
+| `GET/POST /api/pipelines` | List, create, update pipelines; pause, resume, trigger runs |
+| `GET /api/runs` | List all pipeline runs with filters |
+| `GET /api/runs/{run_id}` | Run detail with task list; passively syncs Airflow state when status is `running` |
+| `POST /api/runs/{run_id}/sync` | Force-sync run and all task statuses from Airflow regardless of current DB state |
+| `POST /api/runs/{run_id}/rerun` | Clear and re-trigger a specific task (single, downstream, or full re-run) |
+| `POST /api/config/validate` | Validate a pipeline config JSON before saving |
+| `GET /api/pipelines/{id}/configs` | List all config versions for a pipeline |
+| `GET /api/query/duckdb-files` | List DuckDB output files available for querying |
+| `POST /api/query` | Execute a read-only SQL query against a DuckDB S3 file |
+| `GET /api/metrics/dashboard` | KPI counters for the dashboard |
+| `GET /api/metrics/throughput` | Hourly run counts and row throughput |
+| `GET /api/audit` | Full audit event log with filters |
+| `GET/POST /api/connections` | Manage data source/target connections |
+| `GET/POST /api/deployments` | Deployment approval workflow |
+| `GET /api/eks/jobs` | List EKS Kubernetes Job records |
+| `GET /health` | Health check (used by ALB target group) |
 
 ---
 
@@ -418,8 +461,9 @@ nextgen-databridge/
 │   └── deploy-dev.yml          # On PR merge or manual: build+push+deploy to dev
 ├── airflow/
 │   ├── dags/
-│   │   └── dag_generator.py    # Dynamic DAG generator (reads all active configs)
-│   └── plugins/                # Custom operators deployed to MWAA
+│   │   ├── dag_generator.py    # Dynamic DAG generator (reads all active configs)
+│   │   └── operators/          # Custom Airflow operators (EKSJobOperator, etc.)
+│   └── plugins/                # Airflow plugins directory
 ├── backend/
 │   ├── api/main.py             # FastAPI app (all routes, WebSocket, auth)
 │   ├── models/                 # SQLAlchemy ORM models
@@ -435,7 +479,8 @@ nextgen-databridge/
 │   ├── mwaa/                   # MWAA environment, S3 bucket, IAM
 │   └── wwi/                    # RDS SQL Server, option group, IAM, secrets
 ├── scripts/
-│   └── create_github_role.py   # One-time: creates IAM OIDC role for GitHub Actions
+│   ├── create_github_role.py   # One-time: creates IAM OIDC role for GitHub Actions
+│   └── sync_mwaa_runs.py       # Backfill pipeline_runs from MWAA DAG run history
 └── tests/
     ├── unit/                   # Config validator unit tests
     └── integration/            # FastAPI integration tests
