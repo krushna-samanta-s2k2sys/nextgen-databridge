@@ -860,6 +860,9 @@ async def sync_run_from_airflow(
     try:
         af_run   = await airflow_request("GET", f"/dags/{run.pipeline_id}/dagRuns/{run_id}")
         af_state = af_run.get("state", "")
+        if not af_state:
+            raise HTTPException(502, f"Airflow returned no state for run '{run_id}'. "
+                                     "Check AIRFLOW_URL and credentials.")
 
         if af_state in AF_RUN_MAP:
             end_str = af_run.get("end_date")
@@ -892,35 +895,49 @@ async def sync_run_from_airflow(
                 .values(**update_vals)
             )
 
-        # Sync individual task states from Airflow task instances
+        # Sync individual task states from Airflow task instances.
+        # Match by (run_id, task_id) rather than the exact task_run_id because
+        # Airflow's try_number may not match the attempt_number stored in the DB
+        # (Airflow pre-increments try_number after completion).
         try:
             af_tasks = await airflow_request(
                 "GET",
                 f"/dags/{run.pipeline_id}/dagRuns/{run_id}/taskInstances",
             )
             for ti in af_tasks.get("task_instances", []):
-                ti_state    = ti.get("state", "")
-                ti_task_id  = ti.get("task_id", "")
-                ti_try_num  = ti.get("try_number", 1)
-                task_run_id = f"{run_id}_{ti_task_id}_attempt{ti_try_num}"
-                if ti_state in AF_TASK_MAP:
-                    ti_end_str = ti.get("end_date")
-                    ti_end_dt: Optional[datetime] = None
-                    if ti_end_str:
-                        try:
-                            ti_end_dt = datetime.fromisoformat(ti_end_str.replace("Z", "+00:00"))
-                        except Exception:
-                            pass
-                    task_upd: dict = {"status": AF_TASK_MAP[ti_state]}
-                    if ti_end_dt:
-                        task_upd["end_time"] = ti_end_dt
-                    await db.execute(
-                        update(TaskRun)
-                        .where(TaskRun.task_run_id == task_run_id)
-                        .values(**task_upd)
+                ti_state   = ti.get("state", "")
+                ti_task_id = ti.get("task_id", "")
+                if not ti_task_id or ti_state not in AF_TASK_MAP:
+                    continue
+                ti_end_str = ti.get("end_date")
+                ti_start_str = ti.get("start_date")
+                ti_end_dt: Optional[datetime] = None
+                ti_start_dt: Optional[datetime] = None
+                if ti_end_str:
+                    try:
+                        ti_end_dt = datetime.fromisoformat(ti_end_str.replace("Z", "+00:00"))
+                    except Exception:
+                        pass
+                if ti_start_str:
+                    try:
+                        ti_start_dt = datetime.fromisoformat(ti_start_str.replace("Z", "+00:00"))
+                    except Exception:
+                        pass
+                task_upd: dict = {"status": AF_TASK_MAP[ti_state]}
+                if ti_end_dt:
+                    task_upd["end_time"] = ti_end_dt
+                    if ti_start_dt:
+                        task_upd["duration_seconds"] = (ti_end_dt - ti_start_dt).total_seconds()
+                await db.execute(
+                    update(TaskRun)
+                    .where(
+                        TaskRun.run_id  == run_id,
+                        TaskRun.task_id == ti_task_id,
                     )
+                    .values(**task_upd)
+                )
         except Exception as exc:
-            logger.debug(f"Task instance sync skipped for {run_id}: {exc}")
+            logger.warning(f"Task instance sync failed for {run_id}: {exc}")
 
         await db.commit()
         await db.refresh(run)
