@@ -25,7 +25,26 @@ logger = logging.getLogger("nextgen_databridge.callbacks")
 def _audit_db_conn():
     raw = os.getenv("NEXTGEN_DATABRIDGE_AUDIT_DB_URL", "")
     if not raw:
-        raise RuntimeError("NEXTGEN_DATABRIDGE_AUDIT_DB_URL is not set")
+        # Startup script may not have propagated the env var to Celery workers;
+        # fetch directly from Secrets Manager — the MWAA execution role allows this.
+        try:
+            import boto3 as _boto3, json as _json
+            _sm = _boto3.client(
+                "secretsmanager",
+                region_name=os.getenv("AWS_DEFAULT_REGION", "us-east-1"),
+            )
+            _secret = _sm.get_secret_value(
+                SecretId="nextgen-databridge/connections/audit_db"
+            )
+            raw = _json.loads(_secret["SecretString"]).get("url", "")
+        except Exception as _e:
+            raise RuntimeError(
+                f"NEXTGEN_DATABRIDGE_AUDIT_DB_URL not set and Secrets Manager fallback failed: {_e}"
+            )
+    if not raw:
+        raise RuntimeError(
+            "NEXTGEN_DATABRIDGE_AUDIT_DB_URL is not set and secret 'url' field is empty"
+        )
     url = raw.replace("postgresql+asyncpg://", "postgresql://")
     return psycopg2.connect(url)
 
