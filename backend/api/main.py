@@ -13,6 +13,7 @@ import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
+from urllib.parse import quote
 
 import httpx
 from fastapi import (
@@ -725,7 +726,8 @@ async def get_run(
     # which do not reliably fire DAG-level callbacks in all MWAA versions.
     if run.status == RunStatus.RUNNING and AIRFLOW_URL:
         try:
-            af_run   = await airflow_request("GET", f"/dags/{run.pipeline_id}/dagRuns/{run_id}")
+            _enc_run_id = quote(run_id, safe="")
+            af_run   = await airflow_request("GET", f"/dags/{run.pipeline_id}/dagRuns/{_enc_run_id}")
             af_state = af_run.get("state", "")
 
             AF_RUN_MAP: dict = {
@@ -762,7 +764,7 @@ async def get_run(
                 try:
                     af_tasks = await airflow_request(
                         "GET",
-                        f"/dags/{run.pipeline_id}/dagRuns/{run_id}/taskInstances",
+                        f"/dags/{run.pipeline_id}/dagRuns/{_enc_run_id}/taskInstances",
                     )
                     for ti in af_tasks.get("task_instances", []):
                         ti_state    = ti.get("state", "")
@@ -858,11 +860,13 @@ async def sync_run_from_airflow(
     }
 
     try:
-        af_run   = await airflow_request("GET", f"/dags/{run.pipeline_id}/dagRuns/{run_id}")
+        encoded_run_id = quote(run_id, safe="")
+        af_run   = await airflow_request("GET", f"/dags/{run.pipeline_id}/dagRuns/{encoded_run_id}")
         af_state = af_run.get("state", "")
         if not af_state:
-            raise HTTPException(502, f"Airflow returned no state for run '{run_id}'. "
-                                     "Check AIRFLOW_URL and credentials.")
+            af_detail = af_run.get("detail", af_run.get("message", repr(af_run)))
+            raise HTTPException(502, f"Airflow API error for run '{run_id}': {af_detail}. "
+                                     "Verify AIRFLOW_URL, credentials, and that the run exists in Airflow.")
 
         if af_state in AF_RUN_MAP:
             end_str = af_run.get("end_date")
@@ -902,7 +906,7 @@ async def sync_run_from_airflow(
         try:
             af_tasks = await airflow_request(
                 "GET",
-                f"/dags/{run.pipeline_id}/dagRuns/{run_id}/taskInstances",
+                f"/dags/{run.pipeline_id}/dagRuns/{encoded_run_id}/taskInstances",
             )
             for ti in af_tasks.get("task_instances", []):
                 ti_state   = ti.get("state", "")
