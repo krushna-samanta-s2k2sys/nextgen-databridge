@@ -28,7 +28,6 @@
         "batch_size": 10000
       },
       "output": {
-        "duckdb_path": "s3://${duckdb_store}/pipelines/wwi_inventory_etl/runs/{{ run_id }}/extract_stock_items.duckdb",
         "table": "raw_stock_items"
       }
     },
@@ -37,9 +36,8 @@
       "task_id": "transform_stock_items",
       "type": "duckdb_transform",
       "depends_on": ["extract_stock_items"],
-      "sql": "SELECT StockItemID, StockItemName, SupplierID, MarketingComments, 'success' as status FROM raw_stock_items LIMIT 100",
+      "sql": "SELECT StockItemID, StockItemName, SupplierID, MarketingComments, 'success' as status FROM extract_stock_items.raw_stock_items LIMIT 100",
       "output": {
-        "duckdb_path": "s3://${duckdb_store}/pipelines/wwi_inventory_etl/runs/{{ run_id }}/transform_stock_items.duckdb",
         "table": "stock_items"
       }
     },
