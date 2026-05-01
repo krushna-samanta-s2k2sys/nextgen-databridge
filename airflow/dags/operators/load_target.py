@@ -70,6 +70,7 @@ class LoadTargetOperator(NextGenDatabridgeBaseOperator):
                 run_id, "success",
                 start_time=start_ts, end_time=datetime.now(timezone.utc),
                 duration_seconds=duration, output_row_count=row_count,
+                output_table=target_table,
             )
             return f"Loaded {row_count} rows to {target_type}:{target.get('path', target_table)}"
 

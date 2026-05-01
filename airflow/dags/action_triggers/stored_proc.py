@@ -76,12 +76,15 @@ class StoredProcOperator(NextGenDatabridgeBaseOperator):
 
             row_count             = len(rows)
             output_duckdb_path: Optional[str] = None
+            output_size_bytes:  Optional[int] = None
+            output_table_name   = output_cfg.get("table", "result")
 
             if capture_resultset and rows:
                 output_duckdb_path = self.duckdb_s3_path(run_id, self.task_config["task_id"])
                 local_path         = self.local_duckdb_path(run_id, self.task_config["task_id"])
                 self.ensure_local_dir(local_path)
-                self._write_duckdb(rows, output_cfg.get("table", "result"), local_path)
+                self._write_duckdb(rows, output_table_name, local_path)
+                output_size_bytes = os.path.getsize(local_path)
                 self.upload_duckdb(local_path, output_duckdb_path)
                 logger.info(f"Stored proc result set ({row_count} rows) → {output_duckdb_path}")
 
@@ -95,7 +98,9 @@ class StoredProcOperator(NextGenDatabridgeBaseOperator):
                                  end_time=datetime.now(timezone.utc),
                                  duration_seconds=duration,
                                  output_duckdb_path=output_duckdb_path,
+                                 output_table=output_table_name if output_duckdb_path else None,
                                  output_row_count=row_count,
+                                 output_size_bytes=output_size_bytes,
                                  metrics={"procedure": procedure,
                                           "output_parameters": output_values})
             return {"row_count": row_count, "output_parameters": output_values}
