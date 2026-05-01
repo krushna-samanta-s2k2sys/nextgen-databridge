@@ -25,13 +25,17 @@ export function Runs() {
   const [statusFilter, setStatusFilter]     = useState('')
   const [pipelineFilter, setPipelineFilter] = useState('')
   const [syncingIds, setSyncingIds]         = useState<Set<string>>(new Set())
+  const [syncError, setSyncError]           = useState<string | null>(null)
 
   async function handleSyncRun(e: React.MouseEvent, runId: string) {
     e.stopPropagation()
+    setSyncError(null)
     setSyncingIds(prev => new Set(prev).add(runId))
     try {
       await syncRun(runId)
       queryClient.invalidateQueries({ queryKey: ['runs'] })
+    } catch (err: any) {
+      setSyncError(err?.response?.data?.detail ?? 'Airflow sync failed — check AIRFLOW_URL and credentials')
     } finally {
       setSyncingIds(prev => { const n = new Set(prev); n.delete(runId); return n })
     }
@@ -71,7 +75,8 @@ export function Runs() {
         </div>
       </div>
 
-      {isError && <ErrorBanner message={(error as any)?.response?.data?.detail ?? 'Failed to load runs'} />}
+      {isError   && <ErrorBanner message={(error as any)?.response?.data?.detail ?? 'Failed to load runs'} />}
+      {syncError && <ErrorBanner message={syncError} />}
 
       {/* Filters */}
       <div className="flex gap-3 items-center flex-wrap">
@@ -193,9 +198,16 @@ export function RunDetail() {
         ? 5_000 : false,
   })
 
+  const [syncErr, setSyncErr] = useState<string | null>(null)
   const syncMutation = useMutation({
     mutationFn: () => syncRun(runId!),
-    onSuccess:  () => queryClient.invalidateQueries({ queryKey: ['run', runId] }),
+    onSuccess:  () => {
+      setSyncErr(null)
+      queryClient.invalidateQueries({ queryKey: ['run', runId] })
+    },
+    onError: (err: any) => {
+      setSyncErr(err?.response?.data?.detail ?? 'Airflow sync failed — check AIRFLOW_URL and credentials')
+    },
   })
 
   if (isLoading) return <div className="flex justify-center py-20 bg-gray-50 h-full"><Spinner size="lg" /></div>
@@ -237,6 +249,8 @@ export function RunDetail() {
         <ChevronRight size={12} />
         <span className="text-gray-700 font-mono">{runId?.slice(-20)}</span>
       </div>
+
+      {syncErr && <ErrorBanner message={syncErr} />}
 
       {/* Run summary */}
       <div className="bg-white border border-gray-200 rounded-xl p-5 shadow-sm">
