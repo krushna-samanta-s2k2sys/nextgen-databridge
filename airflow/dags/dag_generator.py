@@ -123,7 +123,7 @@ def _make_task(task_config: dict, dag: DAG, pipeline_config: dict):
         task_config=task_config,
         pipeline_config=pipeline_config,
         duckdb_bucket=os.getenv("NEXTGEN_DATABRIDGE_DUCKDB_BUCKET", "nextgen-databridge-duckdb-store"),
-        audit_db_url=os.getenv("NEXTGEN_DATABRIDGE_AUDIT_DB_URL"),
+        audit_db_url=os.getenv("NEXTGEN_DATABRIDGE_AUDIT_DB_URL", ""),
         retries=task_config.get("retries", pipeline_config.get("retries", 3)),
         retry_delay=timedelta(
             minutes=task_config.get("retry_delay_minutes", pipeline_config.get("retry_delay_minutes", 5))
