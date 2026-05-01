@@ -720,6 +720,76 @@ async def get_run(
     if not run:
         raise HTTPException(404, f"Run '{run_id}' not found")
 
+    # ── Sync with Airflow when the run still shows 'running' in our DB ────────
+    # Catches manual success/failure state changes made from the Airflow UI,
+    # which do not reliably fire DAG-level callbacks in all MWAA versions.
+    if run.status == RunStatus.running and AIRFLOW_URL:
+        try:
+            af_run   = await airflow_request("GET", f"/dags/{run.pipeline_id}/dagRuns/{run_id}")
+            af_state = af_run.get("state", "")
+
+            AF_RUN_MAP: dict = {
+                "success": RunStatus.success,
+                "failed":  RunStatus.failed,
+            }
+            AF_TASK_MAP: dict = {
+                "success":         TaskStatus.success,
+                "failed":          TaskStatus.failed,
+                "upstream_failed": TaskStatus.upstream_failed,
+                "skipped":         TaskStatus.skipped,
+            }
+
+            if af_state in AF_RUN_MAP:
+                end_str = af_run.get("end_date") or af_run.get("start_date")
+                end_dt: Optional[datetime] = None
+                if end_str:
+                    try:
+                        end_dt = datetime.fromisoformat(end_str.replace("Z", "+00:00"))
+                    except Exception:
+                        end_dt = datetime.now(timezone.utc)
+                end_dt = end_dt or datetime.now(timezone.utc)
+                dur    = (end_dt - run.start_time).total_seconds() if run.start_time else None
+
+                await db.execute(
+                    update(PipelineRun)
+                    .where(PipelineRun.run_id == run_id,
+                           PipelineRun.status  == RunStatus.running)
+                    .values(status=AF_RUN_MAP[af_state], end_time=end_dt,
+                            duration_seconds=dur)
+                )
+
+                # Sync individual task states from Airflow task instances.
+                try:
+                    af_tasks = await airflow_request(
+                        "GET",
+                        f"/dags/{run.pipeline_id}/dagRuns/{run_id}/taskInstances",
+                    )
+                    for ti in af_tasks.get("task_instances", []):
+                        ti_state    = ti.get("state", "")
+                        ti_task_id  = ti.get("task_id", "")
+                        ti_try_num  = ti.get("try_number", 1)
+                        task_run_id = f"{run_id}_{ti_task_id}_attempt{ti_try_num}"
+                        if ti_state in AF_TASK_MAP:
+                            await db.execute(
+                                update(TaskRun)
+                                .where(
+                                    TaskRun.task_run_id == task_run_id,
+                                    TaskRun.status.in_(
+                                        [TaskStatus.running, TaskStatus.pending]
+                                    ),
+                                )
+                                .values(status=AF_TASK_MAP[ti_state],
+                                        end_time=end_dt)
+                            )
+                except Exception as exc:
+                    logger.debug(f"Task instance sync skipped for {run_id}: {exc}")
+
+                await db.commit()
+                await db.refresh(run)
+
+        except Exception as exc:
+            logger.warning(f"Airflow state sync failed for run {run_id}: {exc}")
+
     tasks_result = await db.execute(
         select(TaskRun).where(TaskRun.run_id == run_id).order_by(TaskRun.created_at)
     )

@@ -68,9 +68,14 @@ for pipeline_id in pipeline_ids:
             cur.execute(
                 """
                 INSERT INTO pipeline_runs
-                    (id, run_id, pipeline_id, status, trigger_type, start_time, end_time)
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
-                ON CONFLICT (run_id) DO NOTHING
+                    (id, run_id, pipeline_id, status, trigger_type,
+                     start_time, end_time, total_tasks, completed_tasks,
+                     failed_tasks, total_rows_processed)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, 0, 0, 0, 0)
+                ON CONFLICT (run_id) DO UPDATE SET
+                    status   = EXCLUDED.status,
+                    end_time = COALESCE(EXCLUDED.end_time, pipeline_runs.end_time)
+                WHERE pipeline_runs.status = 'running'
                 """,
                 (str(uuid.uuid4()), run_id, pipeline_id, status, trigger_type, start, end),
             )
