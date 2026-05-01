@@ -57,6 +57,8 @@ export const getRun = (id: string) =>
   api.get(`/api/runs/${id}`).then(r => r.data)
 export const rerunTask = (runId: string, d: any) =>
   api.post(`/api/runs/${runId}/rerun`, d).then(r => r.data)
+export const syncRun = (id: string) =>
+  api.post(`/api/runs/${id}/sync`).then(r => r.data)
 
 // Tasks
 export const getTasks = (p?: Record<string,string>) =>
