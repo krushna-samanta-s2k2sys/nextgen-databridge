@@ -64,8 +64,11 @@ class FileIngestOperator(NextGenDatabridgeBaseOperator):
 
             db = duckdb.connect(out_local)
             db.execute(f"CREATE OR REPLACE TABLE {output_table} AS SELECT * FROM df")
+            schema_info  = db.execute(f"DESCRIBE {output_table}").fetchall()
+            schema_dict  = {col[0]: col[1] for col in schema_info}
             db.close()
 
+            size_bytes = os.path.getsize(out_local)
             self.upload_duckdb(out_local, out_s3)
             duration = (datetime.now(timezone.utc) - start_ts).total_seconds()
 
@@ -73,7 +76,9 @@ class FileIngestOperator(NextGenDatabridgeBaseOperator):
                 run_id, "success",
                 start_time=start_ts, end_time=datetime.now(timezone.utc),
                 duration_seconds=duration,
-                output_duckdb_path=out_s3, output_row_count=row_count,
+                output_duckdb_path=out_s3, output_table=output_table,
+                output_row_count=row_count, output_size_bytes=size_bytes,
+                output_schema=schema_dict,
             )
             context["ti"].xcom_push(key="duckdb_path", value=out_s3)
             return out_s3

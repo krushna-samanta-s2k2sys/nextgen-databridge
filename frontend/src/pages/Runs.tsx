@@ -162,7 +162,9 @@ export function RunDetail() {
     queryKey: ['run', runId],
     queryFn: () => getRun(runId!),
     enabled: !!runId,
-    refetchInterval: (data: any) => data?.status === 'running' ? 5_000 : false,
+    refetchInterval: (data: any) =>
+      (data?.status === 'running' || data?.tasks?.some((t: any) => t.status === 'running'))
+        ? 5_000 : false,
   })
 
   if (isLoading) return <div className="flex justify-center py-20 bg-gray-50 h-full"><Spinner size="lg" /></div>

@@ -125,8 +125,10 @@ def _ensure_run_started(dag_id: str, run_id: str, start_time: Optional[datetime]
         conn = _audit_db_conn()
         cur  = conn.cursor()
         cur.execute("""
-            INSERT INTO pipeline_runs (id, run_id, pipeline_id, status, trigger_type, start_time)
-            VALUES (%s, %s, %s, 'running', %s, %s)
+            INSERT INTO pipeline_runs
+                (id, run_id, pipeline_id, status, trigger_type, start_time,
+                 total_tasks, completed_tasks, failed_tasks, total_rows_processed)
+            VALUES (%s, %s, %s, 'running', %s, %s, 0, 0, 0, 0)
             ON CONFLICT (run_id) DO NOTHING
         """, (str(uuid.uuid4()), run_id, dag_id, trigger_type, start_time or datetime.now(timezone.utc)))
         conn.commit()

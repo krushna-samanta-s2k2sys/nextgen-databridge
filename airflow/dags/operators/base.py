@@ -160,13 +160,14 @@ class NextGenDatabridgeBaseOperator(BaseOperator):
             if _status_lower == "success":
                 cur.execute("""
                     UPDATE pipeline_runs
-                    SET completed_tasks      = completed_tasks + 1,
-                        total_rows_processed = total_rows_processed + %s
+                    SET completed_tasks      = COALESCE(completed_tasks, 0) + 1,
+                        total_rows_processed = COALESCE(total_rows_processed, 0) + %s
                     WHERE run_id = %s
                 """, (fields.get("output_row_count") or 0, run_id))
             elif _status_lower == "failed":
                 cur.execute("""
-                    UPDATE pipeline_runs SET failed_tasks = failed_tasks + 1
+                    UPDATE pipeline_runs
+                    SET failed_tasks = COALESCE(failed_tasks, 0) + 1
                     WHERE run_id = %s
                 """, (run_id,))
 
@@ -190,10 +191,11 @@ class NextGenDatabridgeBaseOperator(BaseOperator):
                 )
                 ON CONFLICT (task_run_id) DO UPDATE SET
                     status             = EXCLUDED.status,
-                    output_duckdb_path = EXCLUDED.output_duckdb_path,
-                    output_row_count   = EXCLUDED.output_row_count,
-                    output_size_bytes  = EXCLUDED.output_size_bytes,
-                    output_schema      = EXCLUDED.output_schema,
+                    output_duckdb_path = COALESCE(EXCLUDED.output_duckdb_path, task_runs.output_duckdb_path),
+                    output_table       = COALESCE(EXCLUDED.output_table,       task_runs.output_table),
+                    output_row_count   = COALESCE(EXCLUDED.output_row_count,   task_runs.output_row_count),
+                    output_size_bytes  = COALESCE(EXCLUDED.output_size_bytes,  task_runs.output_size_bytes),
+                    output_schema      = COALESCE(EXCLUDED.output_schema,      task_runs.output_schema),
                     end_time           = EXCLUDED.end_time,
                     duration_seconds   = EXCLUDED.duration_seconds,
                     qc_results         = EXCLUDED.qc_results,
