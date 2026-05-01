@@ -104,7 +104,7 @@
       "task_id": "transform_order_header",
       "type": "duckdb_transform",
       "depends_on": ["validate_orders", "extract_customers", "extract_salespeople"],
-      "sql": "SELECT o.OrderID, o.CustomerID, c.CustomerName, c.IsOnCreditHold, c.CreditLimit, c.StandardDiscountPercentage, o.SalespersonPersonID, sp.SalespersonName, o.OrderDate, o.ExpectedDeliveryDate, o.CustomerPurchaseOrderNumber, o.IsUndersupplyBackordered, o.Comments, DATEDIFF('day', o.OrderDate, o.ExpectedDeliveryDate) AS PromisedLeadDays, CURRENT_TIMESTAMP AS etl_loaded_at FROM extract_orders.raw_orders o LEFT JOIN extract_customers.raw_customers c ON o.CustomerID = c.CustomerID LEFT JOIN extract_salespeople.raw_salespeople sp ON o.SalespersonPersonID = sp.PersonID",
+      "sql": "SELECT o.OrderID, o.CustomerID, c.CustomerName, c.IsOnCreditHold, c.CreditLimit, c.StandardDiscountPercentage, o.SalespersonPersonID, sp.SalespersonName, o.OrderDate, o.ExpectedDeliveryDate, o.CustomerPurchaseOrderNumber, o.IsUndersupplyBackordered, o.Comments, DATEDIFF('day', TRY_CAST(o.OrderDate AS DATE), TRY_CAST(o.ExpectedDeliveryDate AS DATE)) AS PromisedLeadDays, CURRENT_TIMESTAMP AS etl_loaded_at FROM extract_orders.raw_orders o LEFT JOIN extract_customers.raw_customers c ON o.CustomerID = c.CustomerID LEFT JOIN extract_salespeople.raw_salespeople sp ON o.SalespersonPersonID = sp.PersonID",
       "output": {
         "table": "order_header"
       }
