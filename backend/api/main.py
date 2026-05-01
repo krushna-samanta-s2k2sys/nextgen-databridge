@@ -259,6 +259,7 @@ def _mwaa_bearer_token() -> Optional[str]:
 
 
 async def airflow_request(method: str, path: str, **kwargs) -> dict:
+    """Send a request to the Airflow REST API v1; uses MWAA Bearer token on MWAA hosts, Basic auth otherwise."""
     url = f"{AIRFLOW_URL}/api/v1{path}"
     async with httpx.AsyncClient(timeout=30) as client:
         if ".airflow.amazonaws.com" in AIRFLOW_URL:
@@ -340,6 +341,7 @@ async def list_pipelines(
     db: AsyncSession = Depends(get_db),
     current_user: dict = Depends(maybe_token),
 ):
+    """List pipelines with optional status/source/search filters; each entry is enriched with its latest run."""
     q = select(Pipeline)
     if status_filter:
         ps = _to_enum(PipelineStatus, status_filter)
@@ -389,6 +391,7 @@ async def create_pipeline(
     db: AsyncSession = Depends(get_db),
     current_user: dict = Depends(maybe_token),
 ):
+    """Create a pipeline record + initial config version, sync config to S3, and register the DAG with Airflow."""
     user = current_user.get("sub", "api")
     # Validate config
     validator = PipelineConfigValidator()
@@ -444,6 +447,7 @@ async def get_pipeline(
     db: AsyncSession = Depends(get_db),
     current_user: dict = Depends(maybe_token),
 ):
+    """Return pipeline metadata and its active config; falls back to S3 if no config row exists in the DB."""
     result = await db.execute(select(Pipeline).where(Pipeline.pipeline_id == pipeline_id))
     pipeline = result.scalar_one_or_none()
     if not pipeline:
@@ -664,6 +668,7 @@ async def trigger_pipeline(
     db: AsyncSession = Depends(get_db),
     current_user: dict = Depends(maybe_token),
 ):
+    """Trigger a manual DAG run in Airflow and create a matching pipeline_runs record in the audit DB."""
     user = current_user.get("sub", "api")
 
     # Trigger via Airflow API
@@ -745,6 +750,7 @@ async def get_run(
     db: AsyncSession = Depends(get_db),
     current_user: dict = Depends(maybe_token),
 ):
+    """Return run detail and task list; passively syncs status from Airflow when the run is still marked running."""
     result = await db.execute(select(PipelineRun).where(PipelineRun.run_id == run_id))
     run = result.scalar_one_or_none()
     if not run:
@@ -1011,6 +1017,7 @@ async def rerun_task(
     db: AsyncSession = Depends(get_db),
     current_user: dict = Depends(maybe_token),
 ):
+    """Clear and re-trigger task instances in Airflow; supports single, downstream, or full pipeline re-run."""
     user = current_user.get("sub", "api")
 
     run_result = await db.execute(select(PipelineRun).where(PipelineRun.run_id == run_id))
@@ -1238,6 +1245,7 @@ async def create_connection(
     db: AsyncSession = Depends(get_db),
     current_user: dict = Depends(maybe_token),
 ):
+    """Create a data connection record and register it in Airflow so operators can reference it by connection_id."""
     conn = DataConnection(
         id=str(uuid.uuid4()),
         connection_id=req.connection_id,
@@ -1357,6 +1365,7 @@ async def create_deployment(
     db: AsyncSession = Depends(get_db),
     current_user: dict = Depends(maybe_token),
 ):
+    """Submit a pipeline deployment for approval; generates an approval token and emails the designated approver."""
     user = current_user.get("sub", "api")
 
     # Get next deployment number
@@ -1417,6 +1426,7 @@ async def approve_deployment(
     db: AsyncSession = Depends(get_db),
     current_user: dict = Depends(maybe_token),
 ):
+    """Approve a pending deployment; validates the one-time token (if provided) and triggers async execution."""
     user = current_user.get("sub", "api")
     result = await db.execute(select(Deployment).where(Deployment.id == deployment_id))
     dep = result.scalar_one_or_none()
@@ -1565,6 +1575,7 @@ async def list_duckdb_files(
     db: AsyncSession = Depends(get_db),
     current_user: dict = Depends(maybe_token),
 ):
+    """List DuckDB output files available for querying; sourced from task_runs rather than a dedicated registry."""
     # Source from task_runs — the duckdb_files registry is populated by operators
     # that don't exist yet, but task_runs is written by every EKS job on completion.
     q = (
@@ -1601,6 +1612,7 @@ async def dashboard_metrics(
     db: AsyncSession = Depends(get_db),
     current_user: dict = Depends(maybe_token),
 ):
+    """Return KPI counters for the dashboard: active runs, today's success/failure counts, rows processed, active alerts."""
     now = datetime.now(timezone.utc)
     today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
 
