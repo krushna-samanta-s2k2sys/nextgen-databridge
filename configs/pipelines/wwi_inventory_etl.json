@@ -28,7 +28,6 @@
         "batch_size": 10000
       },
       "output": {
-        "duckdb_path": "s3://${duckdb_store}/pipelines/wwi_inventory_etl/runs/{{ run_id }}/extract_stock_items.duckdb",
         "table": "raw_stock_items"
       }
     },
@@ -41,7 +40,6 @@
         "batch_size": 10000
       },
       "output": {
-        "duckdb_path": "s3://${duckdb_store}/pipelines/wwi_inventory_etl/runs/{{ run_id }}/extract_stock_holdings.duckdb",
         "table": "raw_stock_holdings"
       }
     },
@@ -56,7 +54,6 @@
         "batch_size": 200000
       },
       "output": {
-        "duckdb_path": "s3://${duckdb_store}/pipelines/wwi_inventory_etl/runs/{{ run_id }}/extract_stock_transactions.duckdb",
         "table": "raw_stock_transactions"
       }
     },
@@ -69,7 +66,6 @@
         "batch_size": 1000
       },
       "output": {
-        "duckdb_path": "s3://${duckdb_store}/pipelines/wwi_inventory_etl/runs/{{ run_id }}/extract_suppliers.duckdb",
         "table": "raw_suppliers"
       }
     },
@@ -108,7 +104,6 @@
       "depends_on": ["validate_stock_items", "validate_stock_holdings", "extract_suppliers"],
       "sql": "SELECT si.StockItemID, si.StockItemName, si.SupplierID, sup.SupplierName, si.UnitPrice AS CurrentSalePrice, si.RecommendedRetailPrice, si.TaxRate, si.LeadTimeDays, si.IsChillerStock, si.Brand, si.Size, h.QuantityOnHand, h.BinLocation, h.LastCostPrice, h.LastStocktakeQuantity, h.ReorderLevel, h.TargetStockLevel, ROUND(h.QuantityOnHand * h.LastCostPrice, 2) AS StockCostValue, ROUND(h.QuantityOnHand * si.RecommendedRetailPrice, 2) AS StockRetailValue, ROUND(h.QuantityOnHand * si.UnitPrice, 2) AS StockSaleValue, h.TargetStockLevel - h.QuantityOnHand AS StockGap, CASE WHEN h.QuantityOnHand <= 0 THEN 'OUT_OF_STOCK' WHEN h.QuantityOnHand <= h.ReorderLevel THEN 'BELOW_REORDER' WHEN h.QuantityOnHand >= h.TargetStockLevel THEN 'AT_TARGET' ELSE 'NORMAL' END AS StockStatus, CURRENT_TIMESTAMP AS etl_loaded_at FROM extract_stock_items.raw_stock_items si LEFT JOIN extract_stock_holdings.raw_stock_holdings h ON si.StockItemID = h.StockItemID LEFT JOIN extract_suppliers.raw_suppliers sup ON si.SupplierID = sup.SupplierID",
       "output": {
-        "duckdb_path": "s3://${duckdb_store}/pipelines/wwi_inventory_etl/runs/{{ run_id }}/transform_inventory_valuation.duckdb",
         "table": "inventory_valuation"
       }
     },
@@ -118,7 +113,6 @@
       "depends_on": ["validate_stock_items", "validate_stock_holdings", "extract_suppliers", "extract_stock_transactions"],
       "sql": "SELECT si.StockItemID, si.StockItemName, si.SupplierID, sup.SupplierName, si.IsChillerStock, h.QuantityOnHand, h.ReorderLevel, h.LastCostPrice, ROUND(h.QuantityOnHand * h.LastCostPrice, 2) AS StockValue, COALESCE(t.TransactionCount, 0) AS TxCount30Days, COALESCE(t.TotalQtyOut, 0) AS TotalQtyOut30Days, ROUND(COALESCE(t.TotalQtyOut, 0) / 30.0, 2) AS AvgDailyMovement, CASE WHEN h.QuantityOnHand > 0 AND COALESCE(t.TotalQtyOut, 0) > 0 THEN ROUND(h.QuantityOnHand / (COALESCE(t.TotalQtyOut, 0) / 30.0), 0) ELSE NULL END AS DaysOfStock, CASE WHEN COALESCE(t.TransactionCount, 0) = 0 THEN 'DORMANT' WHEN COALESCE(t.AvgDailyMovement, 0) < 1 THEN 'SLOW' WHEN COALESCE(t.AvgDailyMovement, 0) < 5 THEN 'MODERATE' ELSE 'ACTIVE' END AS MovementCategory, CURRENT_TIMESTAMP AS etl_loaded_at FROM extract_stock_items.raw_stock_items si LEFT JOIN extract_stock_holdings.raw_stock_holdings h ON si.StockItemID = h.StockItemID LEFT JOIN extract_suppliers.raw_suppliers sup ON si.SupplierID = sup.SupplierID LEFT JOIN (SELECT StockItemID, COUNT(*) AS TransactionCount, SUM(CASE WHEN Quantity < 0 THEN ABS(Quantity) ELSE 0 END) AS TotalQtyOut, SUM(CASE WHEN Quantity < 0 THEN ABS(Quantity) ELSE 0 END) / 30.0 AS AvgDailyMovement FROM extract_stock_transactions.raw_stock_transactions GROUP BY StockItemID) t ON si.StockItemID = t.StockItemID WHERE h.QuantityOnHand > 0",
       "output": {
-        "duckdb_path": "s3://${duckdb_store}/pipelines/wwi_inventory_etl/runs/{{ run_id }}/transform_slow_movers.duckdb",
         "table": "slow_movers"
       }
     },
@@ -128,7 +122,6 @@
       "depends_on": ["extract_suppliers", "extract_stock_items", "extract_stock_transactions"],
       "sql": "SELECT sup.SupplierID, sup.SupplierName, sup.PhoneNumber, sup.PaymentDays, ROUND(AVG(CAST(si.LeadTimeDays AS DOUBLE)), 1) AS AvgLeadTimeDays, COUNT(DISTINCT si.StockItemID) AS UniqueItemsStocked, COALESCE(t.TotalTransactions, 0) AS TotalTransactions30Days, COALESCE(t.TotalUnitsReceived, 0) AS TotalUnitsReceived30Days, COALESCE(t.TotalUnitsReturned, 0) AS TotalUnitsReturned30Days, ROUND(CASE WHEN COALESCE(t.TotalUnitsReceived, 0) > 0 THEN 100.0 * COALESCE(t.TotalUnitsReturned, 0) / t.TotalUnitsReceived ELSE 0 END, 2) AS ReturnRatePct, CURRENT_TIMESTAMP AS etl_loaded_at FROM extract_suppliers.raw_suppliers sup LEFT JOIN extract_stock_items.raw_stock_items si ON sup.SupplierID = si.SupplierID LEFT JOIN (SELECT si2.SupplierID, COUNT(*) AS TotalTransactions, SUM(CASE WHEN tx.Quantity > 0 THEN tx.Quantity ELSE 0 END) AS TotalUnitsReceived, SUM(CASE WHEN tx.Quantity < 0 THEN ABS(tx.Quantity) ELSE 0 END) AS TotalUnitsReturned FROM extract_stock_transactions.raw_stock_transactions tx JOIN extract_stock_items.raw_stock_items si2 ON tx.StockItemID = si2.StockItemID GROUP BY si2.SupplierID) t ON sup.SupplierID = t.SupplierID GROUP BY sup.SupplierID, sup.SupplierName, sup.PhoneNumber, sup.PaymentDays, t.TotalTransactions, t.TotalUnitsReceived, t.TotalUnitsReturned",
       "output": {
-        "duckdb_path": "s3://${duckdb_store}/pipelines/wwi_inventory_etl/runs/{{ run_id }}/transform_supplier_performance.duckdb",
         "table": "supplier_performance"
       }
     },
