@@ -274,6 +274,35 @@ async def airflow_request(method: str, path: str, **kwargs) -> dict:
         return resp.json() if resp.text else {}
 
 
+async def _fetch_airflow_dag_run(pipeline_id: str, run_id: str) -> dict:
+    """
+    Return the Airflow DAG run dict for *run_id*.
+
+    Strategy:
+    1. Direct path lookup  GET /dags/{dag_id}/dagRuns/{url-encoded-run_id}
+       Works when Airflow's path router handles the encoding correctly.
+    2. List fallback  GET /dags/{dag_id}/dagRuns?limit=200&order_by=-start_date
+       Scans recent runs and matches dag_run_id by exact string comparison,
+       bypassing any path-encoding quirks (colons, +00:00 timezone suffixes, etc.)
+    Returns {} if the run cannot be found via either method.
+    """
+    encoded_run_id = quote(run_id, safe="")
+    af_run = await airflow_request("GET", f"/dags/{pipeline_id}/dagRuns/{encoded_run_id}")
+    if af_run.get("state"):
+        return af_run
+
+    logger.info(f"Direct DAG run lookup returned no state for {run_id!r}; falling back to list scan")
+    list_resp = await airflow_request(
+        "GET",
+        f"/dags/{pipeline_id}/dagRuns",
+        params={"limit": 200, "order_by": "-start_date"},
+    )
+    return next(
+        (r for r in list_resp.get("dag_runs", []) if r.get("dag_run_id") == run_id),
+        {},
+    )
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # ── AUTH ──────────────────────────────────────────────────────────────────────
 # ─────────────────────────────────────────────────────────────────────────────
@@ -726,8 +755,7 @@ async def get_run(
     # which do not reliably fire DAG-level callbacks in all MWAA versions.
     if run.status == RunStatus.RUNNING and AIRFLOW_URL:
         try:
-            _enc_run_id = quote(run_id, safe="")
-            af_run   = await airflow_request("GET", f"/dags/{run.pipeline_id}/dagRuns/{_enc_run_id}")
+            af_run   = await _fetch_airflow_dag_run(run.pipeline_id, run_id)
             af_state = af_run.get("state", "")
 
             AF_RUN_MAP: dict = {
@@ -764,7 +792,7 @@ async def get_run(
                 try:
                     af_tasks = await airflow_request(
                         "GET",
-                        f"/dags/{run.pipeline_id}/dagRuns/{_enc_run_id}/taskInstances",
+                        f"/dags/{run.pipeline_id}/dagRuns/{quote(run_id, safe='')}/taskInstances",
                     )
                     for ti in af_tasks.get("task_instances", []):
                         ti_state    = ti.get("state", "")
@@ -860,13 +888,15 @@ async def sync_run_from_airflow(
     }
 
     try:
-        encoded_run_id = quote(run_id, safe="")
-        af_run   = await airflow_request("GET", f"/dags/{run.pipeline_id}/dagRuns/{encoded_run_id}")
+        af_run   = await _fetch_airflow_dag_run(run.pipeline_id, run_id)
         af_state = af_run.get("state", "")
         if not af_state:
-            af_detail = af_run.get("detail", af_run.get("message", repr(af_run)))
-            raise HTTPException(502, f"Airflow API error for run '{run_id}': {af_detail}. "
-                                     "Verify AIRFLOW_URL, credentials, and that the run exists in Airflow.")
+            af_title  = af_run.get("title") or af_run.get("detail") or af_run.get("message")
+            af_status = af_run.get("status", "")
+            hint = (f"Airflow responded: {af_title} (HTTP {af_status}). "
+                    if af_title else "Run may not exist in Airflow yet. ")
+            raise HTTPException(502, f"{hint}Verify AIRFLOW_URL, DAG name '{run.pipeline_id}', "
+                                     f"and that run '{run_id}' exists in Airflow.")
 
         if af_state in AF_RUN_MAP:
             end_str = af_run.get("end_date")
@@ -903,6 +933,7 @@ async def sync_run_from_airflow(
         # Match by (run_id, task_id) rather than the exact task_run_id because
         # Airflow's try_number may not match the attempt_number stored in the DB
         # (Airflow pre-increments try_number after completion).
+        encoded_run_id = quote(run_id, safe="")
         try:
             af_tasks = await airflow_request(
                 "GET",

@@ -1,0 +1,69 @@
+{
+  "pipeline_id": "Demo_inventory_pipeline",
+  "version": "1.0.0",
+  "description": "WideWorldImporters daily inventory ETL: extract StockItems, Holdings, Transactions and Suppliers, produce inventory valuation, slow-mover analysis and supplier performance tables in TargetDB.",
+  "schedule": "0 7 * * *",
+  "retries": 0,
+  "retry_delay_minutes": 5,
+  "retry_exponential_backoff": true,
+  "sla_minutes": 45,
+  "max_active_runs": 1,
+  "catchup": false,
+  "dag_timeout_minutes": 90,
+  "owner": "data-engineering",
+  "team": "supply-chain",
+  "tags": ["wwi", "inventory", "daily"],
+  "alerting": {
+    "on_failure": ["slack:#data-alerts", "email:data-eng@company.com"],
+    "on_sla_breach": ["slack:#data-alerts"]
+  },
+
+  "tasks": [
+    {
+      "task_id": "extract_stock_items",
+      "type": "sql_extract",
+      "source": {
+        "connection": "wwi_sqlserver",
+        "query": "SELECT si.StockItemID, si.StockItemName, si.SupplierID, si.UnitPrice, si.RecommendedRetailPrice, si.TaxRate, si.LeadTimeDays, si.QuantityPerOuter, si.IsChillerStock, si.Barcode, si.Size, si.Brand, si.MarketingComments FROM Warehouse.StockItems si WHERE si.ValidTo = '9999-12-31 23:59:59.9999999'",
+        "batch_size": 10000
+      },
+      "output": {
+        "duckdb_path": "s3://${duckdb_store}/pipelines/wwi_inventory_etl/runs/{{ run_id }}/extract_stock_items.duckdb",
+        "table": "raw_stock_items"
+      }
+    },
+
+    {
+      "task_id": "transform_stock_items",
+      "type": "duckdb_transform",
+      "depends_on": ["validate_stock_items", "validate_stock_holdings", "extract_suppliers"],
+      "sql": "SELECT StockItemID, StockItemName, SupplierID, MarketingComments, 'success' as status FROM raw_stock_items LIMIT 100",
+      "output": {
+        "duckdb_path": "s3://${duckdb_store}/pipelines/wwi_inventory_etl/runs/{{ run_id }}/transform_stock_items.duckdb",
+        "table": "stock_items"
+      }
+    },
+    {
+      "task_id": "load_stock_items",
+      "type": "load_target",
+      "depends_on": ["transform_stock_items"],
+      "source": { "table": "stock_items" },
+      "target": {
+        "type": "sqlserver",
+        "connection": "wwi_sqlserver_target",
+        "schema": "dbo",
+        "table": "StockItems",
+        "mode": "overwrite"
+      }
+    },
+
+    {
+      "task_id": "notify_complete",
+      "type": "notification",
+      "depends_on": ["load_inventory_valuation", "load_slow_movers", "load_supplier_performance"],
+      "trigger_rule": "all_done",
+      "channels": ["slack:#data-notifications"],
+      "message": "wwi_inventory_etl completed — InventoryValuation, SlowMovingStock, SupplierPerformance refreshed."
+    }
+  ]
+}
