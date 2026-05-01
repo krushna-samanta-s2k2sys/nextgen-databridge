@@ -122,6 +122,11 @@ class NextGenDatabridgeBaseOperator(BaseOperator):
             task_run_id = f"{run_id}_{self.task_config['task_id']}_attempt{fields.get('attempt_number', 1)}"
             self._task_run_id = task_run_id
 
+            task_type_raw = self.task_config.get("type", "").lower().replace("-", "_")
+            task_type_val = task_type_raw if task_type_raw in self._VALID_TASK_TYPES else None
+            _status_lower = status.lower()
+
+            # Ensure pipeline row exists (separate commit so FK is visible to pipeline_runs insert).
             cur.execute("""
                 INSERT INTO pipelines
                     (id, pipeline_id, name, status, created_by, created_at, updated_at)
@@ -131,6 +136,7 @@ class NextGenDatabridgeBaseOperator(BaseOperator):
                   self.pipeline_config.get("name", self.pipeline_id)))
             conn.commit()
 
+            # Ensure pipeline_run row exists (separate commit so FK is visible to task_runs insert).
             cur.execute("""
                 INSERT INTO pipeline_runs
                     (id, run_id, pipeline_id, status, trigger_type,
@@ -141,46 +147,28 @@ class NextGenDatabridgeBaseOperator(BaseOperator):
             """, (str(uuid.uuid4()), run_id, self.pipeline_id))
             conn.commit()
 
+            # All remaining writes in a single transaction so task_runs and
+            # pipeline_runs counters/status are committed atomically.
             total_tasks = len(self.pipeline_config.get("tasks", []))
             cur.execute("""
                 UPDATE pipeline_runs
-                SET start_time = NOW(), total_tasks = %s
-                WHERE run_id = %s AND start_time IS NULL
+                SET start_time  = COALESCE(start_time, NOW()),
+                    total_tasks = GREATEST(total_tasks, %s)
+                WHERE run_id = %s
             """, (total_tasks, run_id))
 
-            _status_upper = status.upper()
-            if _status_upper == "SUCCESS":
+            if _status_lower == "success":
                 cur.execute("""
                     UPDATE pipeline_runs
-                    SET completed_tasks = completed_tasks + 1,
+                    SET completed_tasks      = completed_tasks + 1,
                         total_rows_processed = total_rows_processed + %s
                     WHERE run_id = %s
                 """, (fields.get("output_row_count") or 0, run_id))
-            elif _status_upper == "FAILED":
+            elif _status_lower == "failed":
                 cur.execute("""
                     UPDATE pipeline_runs SET failed_tasks = failed_tasks + 1
                     WHERE run_id = %s
                 """, (run_id,))
-
-            if _status_upper in ("SUCCESS", "FAILED"):
-                cur.execute("""
-                    SELECT total_tasks, completed_tasks, failed_tasks
-                    FROM pipeline_runs WHERE run_id = %s
-                """, (run_id,))
-                row = cur.fetchone()
-                if row:
-                    total_t, completed_t, failed_t = row
-                    if total_t > 0 and (completed_t + failed_t) >= total_t:
-                        final_status = "failed" if failed_t > 0 else "success"
-                        cur.execute("""
-                            UPDATE pipeline_runs
-                            SET status = CAST(%s AS runstatus),
-                                end_time = NOW(),
-                                duration_seconds = EXTRACT(EPOCH FROM (NOW() - start_time))
-                            WHERE run_id = %s AND status = 'running'
-                        """, (final_status, run_id))
-
-            conn.commit()
 
             cur.execute("""
                 INSERT INTO task_runs (
@@ -201,51 +189,71 @@ class NextGenDatabridgeBaseOperator(BaseOperator):
                     %(metrics)s, %(worker_host)s, NOW(), NOW()
                 )
                 ON CONFLICT (task_run_id) DO UPDATE SET
-                    status = EXCLUDED.status,
+                    status             = EXCLUDED.status,
                     output_duckdb_path = EXCLUDED.output_duckdb_path,
-                    output_row_count = EXCLUDED.output_row_count,
-                    output_size_bytes = EXCLUDED.output_size_bytes,
-                    output_schema = EXCLUDED.output_schema,
-                    end_time = EXCLUDED.end_time,
-                    duration_seconds = EXCLUDED.duration_seconds,
-                    qc_results = EXCLUDED.qc_results,
-                    qc_passed = EXCLUDED.qc_passed,
-                    qc_warnings = EXCLUDED.qc_warnings,
-                    qc_failures = EXCLUDED.qc_failures,
-                    error_message = EXCLUDED.error_message,
-                    error_traceback = EXCLUDED.error_traceback,
-                    metrics = EXCLUDED.metrics,
-                    updated_at = NOW()
+                    output_row_count   = EXCLUDED.output_row_count,
+                    output_size_bytes  = EXCLUDED.output_size_bytes,
+                    output_schema      = EXCLUDED.output_schema,
+                    end_time           = EXCLUDED.end_time,
+                    duration_seconds   = EXCLUDED.duration_seconds,
+                    qc_results         = EXCLUDED.qc_results,
+                    qc_passed          = EXCLUDED.qc_passed,
+                    qc_warnings        = EXCLUDED.qc_warnings,
+                    qc_failures        = EXCLUDED.qc_failures,
+                    error_message      = EXCLUDED.error_message,
+                    error_traceback    = EXCLUDED.error_traceback,
+                    metrics            = EXCLUDED.metrics,
+                    updated_at         = NOW()
             """, {
-                "id": str(uuid.uuid4()),
-                "task_run_id": task_run_id,
-                "run_id": run_id,
-                "pipeline_id": self.pipeline_id,
-                "task_id": self.task_config["task_id"],
-                "task_type": self.task_config.get("type", "").lower().replace("-", "_"),
-                "status": status.lower(),
-                "attempt_number": fields.get("attempt_number", 1),
-                "max_attempts": self.task_config.get("retries", self.retries if hasattr(self, "retries") else 3) + 1,
-                "input_sources": json.dumps(fields.get("input_sources", [])),
-                "output_duckdb_path": fields.get("output_duckdb_path"),
-                "output_table": fields.get("output_table"),
-                "output_row_count": fields.get("output_row_count"),
-                "output_size_bytes": fields.get("output_size_bytes"),
-                "output_schema": json.dumps(fields.get("output_schema")) if fields.get("output_schema") else None,
-                "queued_at": fields.get("queued_at"),
-                "start_time": fields.get("start_time"),
-                "end_time": fields.get("end_time"),
-                "duration_seconds": fields.get("duration_seconds"),
-                "qc_results": json.dumps(fields.get("qc_results")) if fields.get("qc_results") else None,
-                "qc_passed": fields.get("qc_passed"),
-                "qc_warnings": fields.get("qc_warnings", 0),
-                "qc_failures": fields.get("qc_failures", 0),
-                "error_message": fields.get("error_message"),
-                "error_traceback": fields.get("error_traceback"),
+                "id":                   str(uuid.uuid4()),
+                "task_run_id":          task_run_id,
+                "run_id":               run_id,
+                "pipeline_id":          self.pipeline_id,
+                "task_id":              self.task_config["task_id"],
+                "task_type":            task_type_val,
+                "status":               _status_lower,
+                "attempt_number":       fields.get("attempt_number", 1),
+                "max_attempts":         self.task_config.get("retries", self.retries if hasattr(self, "retries") else 3) + 1,
+                "input_sources":        json.dumps(fields.get("input_sources", [])),
+                "output_duckdb_path":   fields.get("output_duckdb_path"),
+                "output_table":         fields.get("output_table"),
+                "output_row_count":     fields.get("output_row_count"),
+                "output_size_bytes":    fields.get("output_size_bytes"),
+                "output_schema":        json.dumps(fields.get("output_schema")) if fields.get("output_schema") else None,
+                "queued_at":            fields.get("queued_at"),
+                "start_time":           fields.get("start_time"),
+                "end_time":             fields.get("end_time"),
+                "duration_seconds":     fields.get("duration_seconds"),
+                "qc_results":           json.dumps(fields.get("qc_results")) if fields.get("qc_results") else None,
+                "qc_passed":            fields.get("qc_passed"),
+                "qc_warnings":          fields.get("qc_warnings", 0),
+                "qc_failures":          fields.get("qc_failures", 0),
+                "error_message":        fields.get("error_message"),
+                "error_traceback":      fields.get("error_traceback"),
                 "task_config_snapshot": json.dumps(self.task_config),
-                "metrics": json.dumps(fields.get("metrics", {})),
-                "worker_host": os.getenv("HOSTNAME", "unknown"),
+                "metrics":              json.dumps(fields.get("metrics", {})),
+                "worker_host":          os.getenv("HOSTNAME", "unknown"),
             })
+
+            # Check completion only after task_runs is written (same transaction).
+            if _status_lower in ("success", "failed"):
+                cur.execute("""
+                    SELECT total_tasks, completed_tasks, failed_tasks
+                    FROM pipeline_runs WHERE run_id = %s
+                """, (run_id,))
+                row = cur.fetchone()
+                if row:
+                    total_t, completed_t, failed_t = row
+                    if total_t > 0 and (completed_t + failed_t) >= total_t:
+                        final_status = "failed" if failed_t > 0 else "success"
+                        cur.execute("""
+                            UPDATE pipeline_runs
+                            SET status           = CAST(%s AS runstatus),
+                                end_time         = NOW(),
+                                duration_seconds = EXTRACT(EPOCH FROM (NOW() - start_time))
+                            WHERE run_id = %s AND status = 'running'
+                        """, (final_status, run_id))
+
             conn.commit()
             cur.close()
             conn.close()
@@ -272,7 +280,23 @@ class NextGenDatabridgeBaseOperator(BaseOperator):
 
     # ── DuckDB producer resolution ─────────────────────────────────────────────
     # Task types that pass through DuckDB files without producing new ones.
-    _PASSTHROUGH_TASK_TYPES = {"data_quality", "schema_validation"}
+    _PASSTHROUGH_TASK_TYPES = {"data_quality", "schema_validate", "schema_validation"}
+
+    # Task types that produce a DuckDB output file.
+    _PRODUCER_TASK_TYPES = {
+        "sql_extract", "cdc_extract", "duckdb_transform", "duckdb_query",
+        "file_ingest", "eks_job", "eks_extract", "eks_transform",
+    }
+
+    # All valid values for the tasktype PostgreSQL enum.
+    _VALID_TASK_TYPES = {
+        "sql_extract", "sql_transform", "duckdb_transform", "duckdb_query",
+        "schema_validate", "data_quality", "cdc_extract", "file_ingest",
+        "kafka_consume", "kafka_produce", "pubsub_consume", "pubsub_publish",
+        "eks_job", "eks_extract", "eks_transform",
+        "python_callable", "conditional_branch", "load_target", "notification",
+        "api_call", "autosys_job", "stored_proc",
+    }
 
     def _find_duckdb_producer_task(self, ti, task_id: str, visited: set = None) -> str | None:
         """Walk the DAG upward through passthrough tasks to find the DuckDB-producing task."""
@@ -293,7 +317,7 @@ class NextGenDatabridgeBaseOperator(BaseOperator):
                     return producer
             return None
 
-        if task_type in ("sql_extract", "duckdb_transform"):
+        if task_type in self._PRODUCER_TASK_TYPES:
             return task_id
 
         return None
