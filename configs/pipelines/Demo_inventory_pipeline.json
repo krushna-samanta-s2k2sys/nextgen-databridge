@@ -36,31 +36,18 @@
     {
       "task_id": "transform_stock_items",
       "type": "duckdb_transform",
-      "depends_on": ["validate_stock_items", "validate_stock_holdings", "extract_suppliers"],
+      "depends_on": ["extract_stock_items"],
       "sql": "SELECT StockItemID, StockItemName, SupplierID, MarketingComments, 'success' as status FROM raw_stock_items LIMIT 100",
       "output": {
         "duckdb_path": "s3://${duckdb_store}/pipelines/wwi_inventory_etl/runs/{{ run_id }}/transform_stock_items.duckdb",
         "table": "stock_items"
       }
     },
-    {
-      "task_id": "load_stock_items",
-      "type": "load_target",
-      "depends_on": ["transform_stock_items"],
-      "source": { "table": "stock_items" },
-      "target": {
-        "type": "sqlserver",
-        "connection": "wwi_sqlserver_target",
-        "schema": "dbo",
-        "table": "StockItems",
-        "mode": "overwrite"
-      }
-    },
 
     {
       "task_id": "notify_complete",
       "type": "notification",
-      "depends_on": ["load_inventory_valuation", "load_slow_movers", "load_supplier_performance"],
+      "depends_on": ["transform_stock_items"],
       "trigger_rule": "all_done",
       "channels": ["slack:#data-notifications"],
       "message": "wwi_inventory_etl completed — InventoryValuation, SlowMovingStock, SupplierPerformance refreshed."
