@@ -723,20 +723,20 @@ async def get_run(
     # ── Sync with Airflow when the run still shows 'running' in our DB ────────
     # Catches manual success/failure state changes made from the Airflow UI,
     # which do not reliably fire DAG-level callbacks in all MWAA versions.
-    if run.status == RunStatus.running and AIRFLOW_URL:
+    if run.status == RunStatus.RUNNING and AIRFLOW_URL:
         try:
             af_run   = await airflow_request("GET", f"/dags/{run.pipeline_id}/dagRuns/{run_id}")
             af_state = af_run.get("state", "")
 
             AF_RUN_MAP: dict = {
-                "success": RunStatus.success,
-                "failed":  RunStatus.failed,
+                "success": RunStatus.SUCCESS,
+                "failed":  RunStatus.FAILED,
             }
             AF_TASK_MAP: dict = {
-                "success":         TaskStatus.success,
-                "failed":          TaskStatus.failed,
-                "upstream_failed": TaskStatus.upstream_failed,
-                "skipped":         TaskStatus.skipped,
+                "success":         TaskStatus.SUCCESS,
+                "failed":          TaskStatus.FAILED,
+                "upstream_failed": TaskStatus.UPSTREAM_FAILED,
+                "skipped":         TaskStatus.SKIPPED,
             }
 
             if af_state in AF_RUN_MAP:
@@ -753,7 +753,7 @@ async def get_run(
                 await db.execute(
                     update(PipelineRun)
                     .where(PipelineRun.run_id == run_id,
-                           PipelineRun.status  == RunStatus.running)
+                           PipelineRun.status  == RunStatus.RUNNING)
                     .values(status=AF_RUN_MAP[af_state], end_time=end_dt,
                             duration_seconds=dur)
                 )
@@ -775,7 +775,7 @@ async def get_run(
                                 .where(
                                     TaskRun.task_run_id == task_run_id,
                                     TaskRun.status.in_(
-                                        [TaskStatus.running, TaskStatus.pending]
+                                        [TaskStatus.RUNNING, TaskStatus.PENDING]
                                     ),
                                 )
                                 .values(status=AF_TASK_MAP[ti_state],
