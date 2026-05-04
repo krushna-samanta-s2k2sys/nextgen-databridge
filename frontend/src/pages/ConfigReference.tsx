@@ -443,34 +443,37 @@ const TASK_DEFS: TaskDef[] = [
     category: 'compute',
     icon: Server,
     color: 'text-purple-600',
-    description: 'Submits a Kubernetes Job to the nextgen-databridge EKS cluster for compute-intensive tasks. The job container is passed INPUT_PATHS (upstream DuckDB S3 paths) and OUTPUT_DUCKDB_PATH via env vars. Authentication is handled automatically via IAM presigned STS token.',
+    description: 'Runs a task inside an EKS Kubernetes Job instead of the MWAA worker. Add "engine": "eks" to any task type (sql_extract, duckdb_transform, etc.) to route it to EKS — the DAG generator detects this and switches the operator automatically. The operation type (extract vs transform) is inferred from the original task type. Use "type": "eks_job" only for a standalone EKS task with a fully custom container. The default image is the platform transform ECR image; override with execution.image only when using a custom container.',
     fields: [
-      { field: 'type',           type: 'string',  required: true,  valid: '"eks_job" | "eks_extract" | "eks_transform"', description: 'All three map to EKSJobOperator.' },
-      { field: 'execution.image', type: 'string', required: true,  description: 'Full ECR image URI, e.g. 123456789.dkr.ecr.us-east-1.amazonaws.com/nextgen-databridge-jobs:latest.' },
-      { field: 'execution.cpu',  type: 'string',  required: false, default: '"1"',   description: 'CPU request/limit (Kubernetes format), e.g. "2", "500m".' },
-      { field: 'execution.memory', type: 'string', required: false, default: '"2Gi"', description: 'Memory request/limit, e.g. "4Gi", "512Mi".' },
-      { field: 'execution.namespace', type: 'string', required: false, default: '"nextgen-databridge-jobs"', description: 'Kubernetes namespace.' },
-      { field: 'execution.service_account', type: 'string', required: false, default: '"nextgen-databridge-job-sa"', description: 'K8s service account with AWS IAM IRSA annotations.' },
-      { field: 'execution.env_vars', type: 'object', required: false, description: 'Extra environment variables injected into the pod.' },
-      { field: 'timeout_minutes', type: 'integer', required: false, default: '120',  description: 'Hard timeout — the task fails if the Job does not complete within this time.' },
-      { field: 'depends_on',     type: 'string[]',required: false, description: 'Upstream tasks. Their DuckDB S3 paths are passed in the INPUT_PATHS env var as a JSON map.' },
+      { field: 'engine',         type: 'string',  required: false, valid: '"eks"', description: 'Add to any task type to route execution to EKS. The task type (sql_extract, duckdb_transform, etc.) is preserved for OPERATION_TYPE inference.' },
+      { field: 'type',           type: 'string',  required: true,  valid: '"eks_job"', description: 'Use "eks_job" only for a standalone EKS task. For all other task types, keep their own type and add "engine": "eks" instead.' },
+      { field: 'execution.image', type: 'string', required: false, description: 'ECR image URI. Defaults to the platform transform image for the current environment. Override only when using a custom container.' },
+      { field: 'execution.cpu',  type: 'string',  required: false, default: '"1"',    description: 'CPU request in Kubernetes format, e.g. "250m", "2". Also used as cpu_limit if cpu_limit is not set.' },
+      { field: 'execution.memory', type: 'string', required: false, default: '"2Gi"', description: 'Memory request, e.g. "512Mi", "4Gi". Also used as memory_limit if memory_limit is not set.' },
+      { field: 'execution.cpu_limit',    type: 'string',  required: false, description: 'CPU limit. Defaults to execution.cpu.' },
+      { field: 'execution.memory_limit', type: 'string',  required: false, description: 'Memory limit. Defaults to execution.memory.' },
+      { field: 'execution.namespace', type: 'string', required: false, default: '"nextgen-databridge-jobs"', description: 'Kubernetes namespace for the Job.' },
+      { field: 'execution.service_account', type: 'string', required: false, default: '"nextgen-databridge-task-runner"', description: 'K8s service account with AWS IAM IRSA annotations.' },
+      { field: 'execution.env_vars', type: 'object', required: false, description: 'Extra environment variables injected into the pod. OPERATION_TYPE is always set automatically.' },
+      { field: 'timeout_minutes', type: 'integer', required: false, default: '120',   description: 'Hard timeout — the task fails if the Job does not complete within this time.' },
+      { field: 'depends_on',     type: 'string[]',required: false, description: 'Upstream tasks. Their DuckDB S3 paths are passed in INPUT_PATHS as a JSON map.' },
     ],
     sample: `{
-  "task_id": "heavy_transform_orders",
-  "type": "eks_job",
-  "depends_on": ["extract_domedit_orders"],
-  "execution": {
-    "image": "877707676590.dkr.ecr.us-east-1.amazonaws.com/nextgen-databridge-jobs:latest",
-    "cpu": "4",
-    "memory": "16Gi",
-    "namespace": "nextgen-databridge-jobs",
-    "service_account": "nextgen-databridge-job-sa",
-    "env_vars": {
-      "TRANSFORM_MODE": "full",
-      "PARTITION_BY": "order_date"
-    }
+  "task_id": "extract_large_dataset",
+  "type": "sql_extract",
+  "engine": "eks",
+  "depends_on": [],
+  "source": {
+    "connection": "domedit_oracle",
+    "query": "SELECT * FROM LARGE_TABLE WHERE PROCESS_DATE = :run_date"
   },
-  "timeout_minutes": 60
+  "execution": {
+    "cpu": "250m",
+    "memory": "512Mi",
+    "cpu_limit": "500m",
+    "memory_limit": "1Gi"
+  },
+  "timeout_minutes": 30
 }`,
   },
 
@@ -491,7 +494,8 @@ const TASK_DEFS: TaskDef[] = [
       { field: 'target.schema',  type: 'string',  required: false, default: '"dbo" / "SCHEMA1"', description: 'Database schema. Defaults to "dbo" for SQL Server, connection default for Oracle/PostgreSQL.' },
       { field: 'target.table',   type: 'string',  required: true,  description: 'Destination table name.' },
       { field: 'target.database', type: 'string', required: false, description: 'Override the database name from the connection profile.' },
-      { field: 'target.mode',    type: 'string',  required: false, default: '"append"', valid: '"append" | "overwrite"', description: '"overwrite" truncates the table then appends. "append" adds rows to existing data.' },
+      { field: 'target.mode',    type: 'string',  required: false, default: '"append"', valid: '"append" | "overwrite" | "merge"', description: '"append" inserts all rows. "overwrite" truncates then inserts. "merge" matches on target.keys and updates existing rows or inserts new ones (RDBMS only).' },
+      { field: 'target.keys',    type: 'string[]',required: false, description: 'Column name(s) used as the match key for merge mode. Required when mode is "merge". Example: ["order_id"] or ["pipeline_id", "run_date"].' },
       { field: 'target.bucket',  type: 'string',  required: false, description: 'S3 bucket name (S3 target only).' },
       { field: 'target.path',    type: 'string',  required: false, description: 'S3 key prefix (S3 target only).' },
       { field: 'target.topic',   type: 'string',  required: false, description: 'Kafka topic or PubSub topic name.' },
