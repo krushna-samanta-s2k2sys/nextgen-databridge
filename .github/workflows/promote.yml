@@ -1,14 +1,25 @@
 name: Promote
 
-# Manual-only promotion of a tested dev image to staging or production.
-# No Terraform — all infrastructure is managed via the infra-* workflows.
+# Manual-only promotion of a versioned dev deployment to staging or production.
+# Versions are created by deploy-dev.yml and tracked in AWS SSM Parameter Store.
 #
-# Typical flow:
-#   1. Run with environment=staging  — promotes the latest dev image to staging
-#   2. Verify staging, then run with environment=production — promotes staging image to production
+# Promotion chain:
+#   dev → staging:    any version that completed deploy-dev is eligible
+#   staging → prod:   ONLY the version currently live on staging may be promoted;
+#                     this prevents skipping staging verification
 #
-# Images are never rebuilt. The SHA-tagged image from dev ECR is copied to the
-# target account ECR and deployed from there.
+# Selective deployment: each version manifest records which artifacts changed
+# (apps / dags / configs). Only those artifacts are re-deployed in the target
+# environment — a configs-only version never triggers an image copy or rollout.
+#
+# No infrastructure is touched in staging or production. All infra is managed
+# via the dedicated infra-* workflows.
+#
+# SSM layout (all written by deploy-dev.yml and this workflow):
+#   /nextgen-databridge/versions/{version_id}          — immutable manifest JSON
+#   /nextgen-databridge/deploy/{env}/latest-version    — mutable pointer
+#   /nextgen-databridge/deploy/{env}/last-deployment   — audit record
+#   /nextgen-databridge/image-tag/{env}                — backwards-compat tag
 #
 # Required GitHub Environments (Settings → Environments):
 #   staging    — configure Required Reviewers to gate the deployment
@@ -28,8 +39,8 @@ on:
         required: true
         type: choice
         options: [staging, production]
-      image_tag:
-        description: "Image tag to promote (e.g. sha-abc1234). Leave blank to auto-resolve from the previous environment."
+      version_id:
+        description: "Version to promote (e.g. v20260504-145230-abc1234). Leave blank to auto-resolve from the source environment."
         required: false
         default: ""
 
@@ -44,21 +55,27 @@ env:
   ROLE_ARN_PROD:    arn:aws:iam::PROD_ACCOUNT_ID:role/nextgen-databridge-github-actions-production
 
 jobs:
-  # ── 1. Resolve tag and per-environment config ─────────────────────────────────
+  # ── 1. Resolve version manifest and validate promotion chain ─────────────────
   resolve:
-    name: Resolve Image Tag
+    name: Resolve Version
     runs-on: ubuntu-latest
     outputs:
+      version_id:   ${{ steps.cfg.outputs.version_id }}
+      sha:          ${{ steps.cfg.outputs.sha }}
       image_tag:    ${{ steps.cfg.outputs.image_tag }}
+      deploy_apps:  ${{ steps.cfg.outputs.deploy_apps }}
+      sync_dags:    ${{ steps.cfg.outputs.sync_dags }}
+      sync_configs: ${{ steps.cfg.outputs.sync_configs }}
       role_arn:     ${{ steps.cfg.outputs.role_arn }}
       cluster_name: ${{ steps.cfg.outputs.cluster_name }}
+      source_env:   ${{ steps.cfg.outputs.source_env }}
     steps:
       - uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ env.ROLE_ARN_DEV }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Resolve tag and target config
+      - name: Resolve version and validate chain
         id: cfg
         run: |
           ENV="${{ inputs.environment }}"
@@ -73,30 +90,69 @@ jobs:
             CLUSTER="nextgen-databridge-production"
           fi
 
-          if [[ -n "${{ inputs.image_tag }}" ]]; then
-            TAG="${{ inputs.image_tag }}"
-            echo "Using specified tag: $TAG"
+          # Resolve version_id — explicit input takes precedence
+          if [[ -n "${{ inputs.version_id }}" ]]; then
+            VERSION_ID="${{ inputs.version_id }}"
+            echo "Using specified version: ${VERSION_ID}"
           else
-            TAG=$(aws ssm get-parameter \
-              --name "/nextgen-databridge/image-tag/${SOURCE_ENV}" \
+            VERSION_ID=$(aws ssm get-parameter \
+              --name "/nextgen-databridge/deploy/${SOURCE_ENV}/latest-version" \
               --query Parameter.Value --output text 2>/dev/null || echo "")
-            echo "Resolved tag from ${SOURCE_ENV}: $TAG"
+            [[ -z "$VERSION_ID" ]] && {
+              echo "ERROR: No version found for ${SOURCE_ENV}. Deploy to ${SOURCE_ENV} first, or specify version_id explicitly."
+              exit 1
+            }
+            echo "Auto-resolved version from ${SOURCE_ENV}: ${VERSION_ID}"
           fi
 
-          [[ -z "$TAG" ]] && {
-            echo "ERROR: No image tag found. Deploy to ${SOURCE_ENV} first, or specify image_tag explicitly."
+          # Chain validation: staging→prod requires the version to be live on staging
+          if [[ "$ENV" == "production" ]]; then
+            STAGING_VERSION=$(aws ssm get-parameter \
+              --name "/nextgen-databridge/deploy/staging/latest-version" \
+              --query Parameter.Value --output text 2>/dev/null || echo "")
+            if [[ "$STAGING_VERSION" != "$VERSION_ID" ]]; then
+              echo "ERROR: Chain validation failed."
+              echo "  Requested version:       ${VERSION_ID}"
+              echo "  Staging current version: ${STAGING_VERSION:-<none>}"
+              echo "  Promote ${VERSION_ID} to staging first before promoting to production."
+              exit 1
+            fi
+            echo "Chain validation passed: staging is running ${VERSION_ID}."
+          fi
+
+          # Load immutable version manifest
+          MANIFEST=$(aws ssm get-parameter \
+            --name "/nextgen-databridge/versions/${VERSION_ID}" \
+            --query Parameter.Value --output text 2>/dev/null || echo "")
+          [[ -z "$MANIFEST" ]] && {
+            echo "ERROR: Version manifest not found at /nextgen-databridge/versions/${VERSION_ID}"
             exit 1
           }
+          echo "Manifest:"
+          echo "$MANIFEST" | python3 -m json.tool
 
-          echo "image_tag=${TAG}"         >> "$GITHUB_OUTPUT"
-          echo "role_arn=${ROLE}"         >> "$GITHUB_OUTPUT"
-          echo "cluster_name=${CLUSTER}"  >> "$GITHUB_OUTPUT"
+          SHA=$(echo "$MANIFEST"         | python3 -c "import json,sys; print(json.load(sys.stdin)['sha'])")
+          IMAGE_TAG=$(echo "$MANIFEST"   | python3 -c "import json,sys; d=json.load(sys.stdin); v=d.get('image_tag'); print(v if v else '')")
+          DEPLOY_APPS=$(echo "$MANIFEST" | python3 -c "import json,sys; print(str(json.load(sys.stdin)['artifacts']['apps']).lower())")
+          SYNC_DAGS=$(echo "$MANIFEST"   | python3 -c "import json,sys; print(str(json.load(sys.stdin)['artifacts']['dags']).lower())")
+          SYNC_CONFIGS=$(echo "$MANIFEST"| python3 -c "import json,sys; print(str(json.load(sys.stdin)['artifacts']['configs']).lower())")
 
-  # ── 2a. Copy ECR images from dev to target account (parallel with validate) ───
+          echo "version_id=${VERSION_ID}"      >> "$GITHUB_OUTPUT"
+          echo "sha=${SHA}"                    >> "$GITHUB_OUTPUT"
+          echo "image_tag=${IMAGE_TAG}"        >> "$GITHUB_OUTPUT"
+          echo "deploy_apps=${DEPLOY_APPS}"    >> "$GITHUB_OUTPUT"
+          echo "sync_dags=${SYNC_DAGS}"        >> "$GITHUB_OUTPUT"
+          echo "sync_configs=${SYNC_CONFIGS}"  >> "$GITHUB_OUTPUT"
+          echo "role_arn=${ROLE}"              >> "$GITHUB_OUTPUT"
+          echo "cluster_name=${CLUSTER}"       >> "$GITHUB_OUTPUT"
+          echo "source_env=${SOURCE_ENV}"      >> "$GITHUB_OUTPUT"
+
+  # ── 2a. Copy ECR images from dev → target account (skipped for non-app versions)
   copy-images:
     name: "Copy ECR Images → ${{ inputs.environment }}"
     runs-on: ubuntu-latest
     needs: resolve
+    if: needs.resolve.outputs.deploy_apps == 'true'
     outputs:
       target_registry: ${{ steps.push.outputs.target_registry }}
     steps:
@@ -174,13 +230,24 @@ jobs:
           echo "Secret nextgen-databridge/connections/audit_db: OK"
 
   # ── 3. Deploy — gated by GitHub Environment approval ─────────────────────────
+  #
+  # Checks out the exact SHA recorded in the version manifest (not main HEAD).
+  # Steps are conditional on which artifacts the version includes.
   deploy:
     name: "Deploy — ${{ inputs.environment }}"
     runs-on: ubuntu-latest
     needs: [resolve, copy-images, validate-infra]
+    if: |
+      always() &&
+      needs.resolve.result        == 'success' &&
+      needs.validate-infra.result == 'success' &&
+      (needs.copy-images.result   == 'success' || needs.copy-images.result == 'skipped')
     environment: ${{ inputs.environment }}
     steps:
+      # Checkout the exact commit that was tested in dev — never main HEAD
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve.outputs.sha }}
 
       - uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -188,8 +255,10 @@ jobs:
           aws-region: ${{ env.AWS_REGION }}
 
       - uses: azure/setup-kubectl@v4
+        if: needs.resolve.outputs.deploy_apps == 'true'
 
       - name: Update kubeconfig
+        if: needs.resolve.outputs.deploy_apps == 'true'
         run: |
           aws eks update-kubeconfig \
             --region "${{ env.AWS_REGION }}" \
@@ -197,6 +266,7 @@ jobs:
 
       - name: Resolve dynamic values
         id: vals
+        if: needs.resolve.outputs.deploy_apps == 'true'
         run: |
           ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
           REGISTRY="${ACCOUNT}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com"
@@ -218,11 +288,13 @@ jobs:
           echo "airflow_url=https://${AIRFLOW_URL}" >> "$GITHUB_OUTPUT"
 
       - name: Sync DAGs to MWAA bucket
+        if: needs.resolve.outputs.sync_dags == 'true'
         run: |
           MWAA_BUCKET="nextgen-databridge-mwaa-${{ inputs.environment }}"
           MWAA_BUCKET="$MWAA_BUCKET" bash airflow/deploy_to_mwaa.sh
 
       - name: Upload pipeline configs
+        if: needs.resolve.outputs.sync_configs == 'true'
         run: |
           BUCKET="nextgen-databridge-pipeline-configs-${{ inputs.environment }}"
           aws s3 cp "configs/environments/${{ inputs.environment }}.json" \
@@ -232,6 +304,7 @@ jobs:
           done
 
       - name: Apply Kubernetes manifests
+        if: needs.resolve.outputs.deploy_apps == 'true'
         env:
           IMAGE_TAG:    ${{ needs.resolve.outputs.image_tag }}
           REGISTRY:     ${{ steps.vals.outputs.registry }}
@@ -253,6 +326,7 @@ jobs:
             eks/manifests/platform.yaml | kubectl apply -f -
 
       - name: Wait for rollout
+        if: needs.resolve.outputs.deploy_apps == 'true'
         run: |
           kubectl rollout status deployment/nextgen-databridge-api \
             -n nextgen-databridge --timeout=300s
@@ -260,16 +334,17 @@ jobs:
             -n nextgen-databridge --timeout=180s
 
       - name: Rollback on failure
-        if: failure()
+        if: failure() && needs.resolve.outputs.deploy_apps == 'true'
         run: |
           kubectl rollout undo deployment/nextgen-databridge-api -n nextgen-databridge || true
           kubectl rollout undo deployment/nextgen-databridge-ui  -n nextgen-databridge || true
 
-  # ── 4. Smoke tests ────────────────────────────────────────────────────────────
+  # ── 4. Smoke tests (only when app images were part of this version) ───────────
   smoke-test:
     name: "Smoke Tests — ${{ inputs.environment }}"
     runs-on: ubuntu-latest
     needs: [resolve, deploy]
+    if: needs.resolve.outputs.deploy_apps == 'true'
     steps:
       - uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -308,49 +383,85 @@ jobs:
             kubectl get pods -n nextgen-databridge
           fi
 
-  # ── 5. Record tag in SSM for next promotion ───────────────────────────────────
-  record-tag:
-    name: "Record Image Tag — ${{ inputs.environment }}"
+  # ── 5. Record deployment in SSM ───────────────────────────────────────────────
+  record-deployment:
+    name: "Record Deployment — ${{ inputs.environment }}"
     runs-on: ubuntu-latest
-    needs: [resolve, smoke-test]
-    if: needs.smoke-test.result == 'success'
+    needs: [resolve, deploy, smoke-test]
+    if: |
+      always() &&
+      needs.deploy.result == 'success' &&
+      (needs.smoke-test.result == 'success' || needs.smoke-test.result == 'skipped')
     steps:
       - uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ env.ROLE_ARN_DEV }}
           aws-region: ${{ env.AWS_REGION }}
-      - run: |
+
+      - name: Write deployment records to SSM
+        run: |
+          VERSION_ID="${{ needs.resolve.outputs.version_id }}"
+          ENV="${{ inputs.environment }}"
+
+          # Advance the environment pointer to this version
           aws ssm put-parameter \
-            --name "/nextgen-databridge/image-tag/${{ inputs.environment }}" \
-            --value "${{ needs.resolve.outputs.image_tag }}" \
+            --name "/nextgen-databridge/deploy/${ENV}/latest-version" \
+            --value "${VERSION_ID}" \
             --type String --overwrite
-          echo "Recorded ${{ inputs.environment }} tag: ${{ needs.resolve.outputs.image_tag }}"
+
+          # Audit record
+          AUDIT="{\"version_id\":\"${VERSION_ID}\",\"deployed_at\":\"$(date -u '+%Y-%m-%dT%H:%M:%SZ')\",\"deployed_by\":\"${{ github.actor }}\",\"run_id\":\"${{ github.run_id }}\",\"run_url\":\"${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\"}"
+          aws ssm put-parameter \
+            --name "/nextgen-databridge/deploy/${ENV}/last-deployment" \
+            --value "$AUDIT" \
+            --type String --overwrite
+
+          # Backwards compatibility: keep image-tag parameter when apps were deployed
+          IMAGE_TAG="${{ needs.resolve.outputs.image_tag }}"
+          if [[ -n "$IMAGE_TAG" ]]; then
+            aws ssm put-parameter \
+              --name "/nextgen-databridge/image-tag/${ENV}" \
+              --value "${IMAGE_TAG}" \
+              --type String --overwrite
+          fi
+
+          echo "Recorded: ${ENV} → ${VERSION_ID}"
 
   # ── 6. Summary + notification ─────────────────────────────────────────────────
   summary:
     name: Summary
     runs-on: ubuntu-latest
-    needs: [resolve, copy-images, deploy, smoke-test, record-tag]
+    needs: [resolve, copy-images, validate-infra, deploy, smoke-test, record-deployment]
     if: always()
     steps:
       - name: Write summary
         run: |
-          RESULT=$([[ "${{ needs.smoke-test.result }}" == "success" ]] && echo "Success" || echo "${{ needs.smoke-test.result }}")
+          DEPLOY_STATUS="${{ needs.deploy.result }}"
+          SMOKE_STATUS="${{ needs.smoke-test.result }}"
+          OVERALL=$([[ "$DEPLOY_STATUS" == "success" && ("$SMOKE_STATUS" == "success" || "$SMOKE_STATUS" == "skipped") ]] && echo "Success" || echo "Failed")
+
           {
             echo "## Promote — ${{ inputs.environment }}"
             echo ""
             echo "| Field | Value |"
             echo "|---|---|"
             echo "| Environment | \`${{ inputs.environment }}\` |"
+            echo "| Version | \`${{ needs.resolve.outputs.version_id }}\` |"
+            echo "| SHA | \`${{ needs.resolve.outputs.sha }}\` |"
             echo "| Image Tag | \`${{ needs.resolve.outputs.image_tag }}\` |"
             echo "| Actor | @${{ github.actor }} |"
-            echo "| Result | ${RESULT} |"
+            echo "| Apps Deployed | ${{ needs.resolve.outputs.deploy_apps }} |"
+            echo "| DAGs Synced | ${{ needs.resolve.outputs.sync_dags }} |"
+            echo "| Configs Synced | ${{ needs.resolve.outputs.sync_configs }} |"
+            echo "| Overall | **${OVERALL}** |"
             echo ""
             echo "| Job | Result |"
             echo "|---|---|"
             echo "| Copy Images | ${{ needs.copy-images.result }} |"
+            echo "| Validate Infra | ${{ needs.validate-infra.result }} |"
             echo "| Deploy | ${{ needs.deploy.result }} |"
             echo "| Smoke Tests | ${{ needs.smoke-test.result }} |"
+            echo "| Record Deployment | ${{ needs.record-deployment.result }} |"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Notify Slack
@@ -360,7 +471,16 @@ jobs:
         with:
           payload: |
             {
-              "text": "${{ needs.smoke-test.result == 'success' && format(':rocket: *{0} deployed* — `{1}`', inputs.environment, needs.resolve.outputs.image_tag) || format(':x: *{0} promotion failed* — `{1}`', inputs.environment, needs.resolve.outputs.image_tag) }} — <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View run>"
+              "text": "${{ needs.deploy.result == 'success' && format(':rocket: *{0} promoted* — version `{1}`', inputs.environment, needs.resolve.outputs.version_id) || format(':x: *{0} promotion failed* — version `{1}`', inputs.environment, needs.resolve.outputs.version_id) }} — <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View run>",
+              "attachments": [{
+                "color": "${{ needs.deploy.result == 'success' && 'good' || 'danger' }}",
+                "fields": [
+                  { "title": "Version",  "value": "${{ needs.resolve.outputs.version_id }}", "short": true },
+                  { "title": "Apps",     "value": "${{ needs.resolve.outputs.deploy_apps }}", "short": true },
+                  { "title": "DAGs",     "value": "${{ needs.resolve.outputs.sync_dags }}",   "short": true },
+                  { "title": "Configs",  "value": "${{ needs.resolve.outputs.sync_configs }}", "short": true }
+                ]
+              }]
             }
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
