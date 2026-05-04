@@ -14,6 +14,7 @@ import { ConfiguredPipelines, PipelineConfigDetail } from './pages/ConfiguredPip
 import { Runs, RunDetail } from './pages/Runs'
 import QueryEditor from './pages/QueryEditor'
 import ConfigReference from './pages/ConfigReference'
+import InfrastructureArchitecture from './pages/InfrastructureArchitecture'
 
 const qc = new QueryClient({
   defaultOptions: { queries: { retry: 1, staleTime: 10_000 } },
@@ -139,7 +140,8 @@ function AppShell() {
           <Route path="/runs"            element={<Runs />} />
           <Route path="/runs/:runId"     element={<RunDetail />} />
           <Route path="/query"           element={<QueryEditor />} />
-          <Route path="/reference"      element={<ConfigReference />} />
+          <Route path="/reference"        element={<ConfigReference />} />
+          <Route path="/infrastructure"  element={<InfrastructureArchitecture />} />
           <Route path="*"               element={<Navigate to="/" />} />
         </Routes>
       </main>
