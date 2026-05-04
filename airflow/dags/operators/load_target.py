@@ -100,8 +100,76 @@ class LoadTargetOperator(NextGenDatabridgeBaseOperator):
                 if exists:
                     conn.execute(text(f"TRUNCATE TABLE [{schema}].[{table}]"))
             self._to_sql_safe(df, table, engine, schema, "append", dialect)
+        elif mode == "merge":
+            keys = target.get("keys", [])
+            if not keys:
+                raise ValueError(
+                    f"target.keys is required when mode='merge' (task loading into {schema}.{table})"
+                )
+            self._merge_to_rdbms(df, table, engine, schema, keys, dialect)
         else:
             self._to_sql_safe(df, table, engine, schema, "append", dialect)
+
+    def _merge_to_rdbms(self, df, table: str, engine, schema: str, keys: list, dialect: str):
+        """Insert new rows and update matched rows using dialect-specific MERGE / ON CONFLICT."""
+        import uuid
+        from sqlalchemy import text
+
+        cols     = list(df.columns)
+        non_keys = [c for c in cols if c not in keys]
+        stage    = f"ngup_{uuid.uuid4().hex[:8]}"
+
+        with engine.begin() as conn:
+            df.to_sql(stage, conn, schema=schema, if_exists="replace", index=False, chunksize=5000)
+
+            if "mssql" in dialect:
+                on_  = " AND ".join(f"t.[{k}]=s.[{k}]" for k in keys)
+                ic   = ", ".join(f"[{c}]" for c in cols)
+                iv   = ", ".join(f"s.[{c}]" for c in cols)
+                when_matched = (
+                    "WHEN MATCHED THEN UPDATE SET " +
+                    ", ".join(f"t.[{c}]=s.[{c}]" for c in non_keys)
+                ) if non_keys else ""
+                conn.execute(text(
+                    f"MERGE [{schema}].[{table}] AS t "
+                    f"USING [{schema}].[{stage}] AS s ON ({on_}) "
+                    f"{when_matched} "
+                    f"WHEN NOT MATCHED THEN INSERT ({ic}) VALUES ({iv});"
+                ))
+                conn.execute(text(f"DROP TABLE [{schema}].[{stage}]"))
+
+            elif "postgresql" in dialect:
+                oc  = ", ".join(f'"{k}"' for k in keys)
+                ic  = ", ".join(f'"{c}"' for c in cols)
+                do_ = (
+                    "DO UPDATE SET " + ", ".join(f'"{c}"=EXCLUDED."{c}"' for c in non_keys)
+                    if non_keys else "DO NOTHING"
+                )
+                conn.execute(text(
+                    f'INSERT INTO "{schema}"."{table}" ({ic}) '
+                    f'SELECT {ic} FROM "{schema}"."{stage}" '
+                    f"ON CONFLICT ({oc}) {do_}"
+                ))
+                conn.execute(text(f'DROP TABLE "{schema}"."{stage}"'))
+
+            elif "oracle" in dialect:
+                on_  = " AND ".join(f"t.{k}=s.{k}" for k in keys)
+                ic   = ", ".join(cols)
+                iv   = ", ".join(f"s.{c}" for c in cols)
+                when_matched = (
+                    "WHEN MATCHED THEN UPDATE SET " +
+                    ", ".join(f"t.{c}=s.{c}" for c in non_keys)
+                ) if non_keys else ""
+                conn.execute(text(
+                    f"MERGE INTO {schema}.{table} t "
+                    f"USING {schema}.{stage} s ON ({on_}) "
+                    f"{when_matched} "
+                    f"WHEN NOT MATCHED THEN INSERT ({ic}) VALUES ({iv})"
+                ))
+                conn.execute(text(f"DROP TABLE {schema}.{stage}"))
+
+            else:
+                raise ValueError(f"merge mode is not supported for dialect: {dialect}")
 
     def _to_sql_safe(self, df, table: str, engine, schema: str, if_exists: str, dialect: str):
         """Write df to RDBMS, automatically dropping rowversion/timestamp columns on SQL Server."""

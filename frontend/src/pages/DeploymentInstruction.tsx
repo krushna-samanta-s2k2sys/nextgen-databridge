@@ -371,11 +371,7 @@ function VersioningTab() {
 │   └── production/
 │       ├── latest-version  = "v20260501-080000-deadbeef"
 │       └── last-deployment = { ... }
-│
-└── image-tag/                                 ← BACKWARDS COMPAT
-    ├── dev         = "sha-b9138fbfee..."
-    ├── staging     = "sha-a1b2c3d..."
-    └── production  = "sha-deadbeef..."`}</CodeBlock>
+`}</CodeBlock>
       </div>
 
       <Divider />
