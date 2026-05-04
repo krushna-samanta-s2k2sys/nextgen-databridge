@@ -3,7 +3,7 @@ import { NavLink } from 'react-router-dom'
 import clsx from 'clsx'
 import {
   LayoutDashboard, Settings2, Activity, Database,
-  Zap, ChevronLeft, Wifi, WifiOff, LogOut, BookOpen,
+  Zap, ChevronLeft, Wifi, WifiOff, LogOut, BookOpen, Server,
 } from 'lucide-react'
 import { useStore } from '../store/useStore'
 
@@ -12,7 +12,8 @@ const NAV_ITEMS = [
   { to: '/pipelines', icon: Settings2,       label: 'Pipelines'       },
   { to: '/runs',      icon: Activity,        label: 'Pipeline Runs'   },
   { to: '/query',     icon: Database,        label: 'Query Editor'    },
-  { to: '/reference', icon: BookOpen,        label: 'Config Reference' },
+  { to: '/reference',       icon: BookOpen, label: 'Config Reference'  },
+  { to: '/infrastructure',  icon: Server,   label: 'Infrastructure'    },
 ]
 
 export function Sidebar() {
