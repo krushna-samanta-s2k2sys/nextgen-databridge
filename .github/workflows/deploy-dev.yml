@@ -504,34 +504,78 @@ jobs:
           MWAA_HOST="$MWAA_HOST" MWAA_TOKEN="$TOKEN" DB_URL="$DB_URL" \
             PIPELINE_IDS="$PIPELINE_IDS" python3 scripts/sync_mwaa_runs.py
 
-  # ── 7. Record image tag in SSM for promotion ─────────────────────────────────
-  record-image-tag:
-    name: Record Image Tag
+  # ── 7. Record versioned deployment manifest in SSM for promotion ─────────────
+  record-version:
+    name: Record Version
     runs-on: ubuntu-latest
-    needs: [guard, smoke-test]
-    if: needs.smoke-test.result == 'success'
+    needs: [guard, smoke-test, sync-dags, sync-configs]
+    if: |
+      always() &&
+      needs.guard.result == 'success' &&
+      (
+        needs.smoke-test.result == 'success' ||
+        (needs.smoke-test.result == 'skipped' &&
+         (needs.sync-dags.result == 'success' || needs.sync-configs.result == 'success'))
+      )
     steps:
       - uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ env.ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
-      - name: Write image tag to SSM
+
+      - name: Generate version manifest and write to SSM
         run: |
+          SHA7="${{ github.sha }}"
+          VERSION_ID="v$(date -u '+%Y%m%d-%H%M%S')-${SHA7:0:7}"
+
+          # Flags reflect what actually succeeded, not just what was detected
+          APPS_DEPLOYED="false"
+          DAGS_DEPLOYED="false"
+          CONFIGS_DEPLOYED="false"
+          [[ "${{ needs.smoke-test.result }}"   == "success" ]] && APPS_DEPLOYED="true"
+          [[ "${{ needs.sync-dags.result }}"    == "success" ]] && DAGS_DEPLOYED="true"
+          [[ "${{ needs.sync-configs.result }}" == "success" ]] && CONFIGS_DEPLOYED="true"
+
+          if [[ "$APPS_DEPLOYED" == "true" ]]; then
+            IMAGE_TAG_JSON="\"sha-${{ github.sha }}\""
+          else
+            IMAGE_TAG_JSON="null"
+          fi
+
+          MANIFEST="{\"version_id\":\"${VERSION_ID}\",\"sha\":\"${{ github.sha }}\",\"created_at\":\"$(date -u '+%Y-%m-%dT%H:%M:%SZ')\",\"created_by\":\"${{ github.actor }}\",\"run_id\":\"${{ github.run_id }}\",\"run_url\":\"${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\",\"image_tag\":${IMAGE_TAG_JSON},\"artifacts\":{\"apps\":${APPS_DEPLOYED},\"dags\":${DAGS_DEPLOYED},\"configs\":${CONFIGS_DEPLOYED}}}"
+
+          # Immutable manifest keyed by version_id
           aws ssm put-parameter \
-            --name "/nextgen-databridge/image-tag/dev" \
-            --value "sha-${{ github.sha }}" \
+            --name "/nextgen-databridge/versions/${VERSION_ID}" \
+            --value "$MANIFEST" \
             --type String --overwrite
+
+          # Mutable pointer — promote.yml reads this to find the latest dev version
           aws ssm put-parameter \
-            --name "/nextgen-databridge/deploy-sha/dev" \
-            --value "${{ github.sha }}" \
+            --name "/nextgen-databridge/deploy/dev/latest-version" \
+            --value "${VERSION_ID}" \
             --type String --overwrite
-          echo "Recorded dev image tag: sha-${{ github.sha }}"
+
+          # Backwards compatibility with existing consumers of image-tag/dev
+          if [[ "$APPS_DEPLOYED" == "true" ]]; then
+            aws ssm put-parameter \
+              --name "/nextgen-databridge/image-tag/dev" \
+              --value "sha-${{ github.sha }}" \
+              --type String --overwrite
+            aws ssm put-parameter \
+              --name "/nextgen-databridge/deploy-sha/dev" \
+              --value "${{ github.sha }}" \
+              --type String --overwrite
+          fi
+
+          echo "Version ${VERSION_ID} recorded"
+          echo "  apps=${APPS_DEPLOYED}  dags=${DAGS_DEPLOYED}  configs=${CONFIGS_DEPLOYED}"
 
   # ── 8. Summary + notification ─────────────────────────────────────────────────
   summary:
     name: Deployment Summary
     runs-on: ubuntu-latest
-    needs: [guard, build-meta, deploy-apps, smoke-test, sync-dags, sync-configs, register-pipelines]
+    needs: [guard, build-meta, deploy-apps, smoke-test, sync-dags, sync-configs, register-pipelines, record-version]
     if: always() && (github.event_name == 'workflow_dispatch' || github.event.pull_request.merged == true)
     steps:
       - name: Write job summary
