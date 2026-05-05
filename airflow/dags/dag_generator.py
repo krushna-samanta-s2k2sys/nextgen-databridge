@@ -17,6 +17,7 @@ from airflow import DAG
 from airflow.operators.python import PythonOperator, BranchPythonOperator
 from airflow.operators.empty import EmptyOperator
 from airflow.operators.trigger_dagrun import TriggerDagRunOperator
+from airflow.sensors.external_task import ExternalTaskSensor
 from airflow.utils.dates import days_ago
 from airflow.utils.task_group import TaskGroup
 from airflow.hooks.base import BaseHook
@@ -312,6 +313,8 @@ def build_dag(pipeline_config: dict) -> DAG:
         # Add explicit start/end nodes when multiple roots/leaves
         start = EmptyOperator(task_id="_pipeline_start", dag=dag)
         end   = EmptyOperator(task_id="_pipeline_end", dag=dag, trigger_rule="all_done")
+        tasks_by_id["_pipeline_start"] = start
+        tasks_by_id["_pipeline_end"]   = end
 
         for root_id in roots:
             if root_id in tasks_by_id:
@@ -320,6 +323,57 @@ def build_dag(pipeline_config: dict) -> DAG:
         for leaf_id in leaves:
             if leaf_id in tasks_by_id:
                 tasks_by_id[leaf_id] >> end
+
+    # ── Cross-DAG upstream sensors ────────────────────────────────────────
+    # Each upstream entry creates an ExternalTaskSensor that blocks until the
+    # upstream DAG reaches an allowed state before any task in this DAG starts.
+    dag_deps        = pipeline_config.get("dag_dependencies", {})
+    upstream_deps   = dag_deps.get("upstream", [])
+    downstream_deps = dag_deps.get("downstream", [])
+
+    for upstream_dep in upstream_deps:
+        upstream_pid   = upstream_dep["pipeline_id"]
+        allowed_states = upstream_dep.get("allowed_states", ["success"])
+        timeout_secs   = int(upstream_dep.get("timeout_minutes", 240) * 60)
+
+        sensor = ExternalTaskSensor(
+            task_id=f"wait_for_{upstream_pid}",
+            external_dag_id=upstream_pid,
+            external_task_id=None,  # None = wait for the entire upstream DAG
+            allowed_states=allowed_states,
+            poke_interval=60,
+            timeout=timeout_secs,
+            mode="reschedule",      # free the worker slot between pokes
+            dag=dag,
+        )
+        if "_pipeline_start" in tasks_by_id:
+            sensor >> tasks_by_id["_pipeline_start"]
+        else:
+            for root_id in roots:
+                if root_id in tasks_by_id:
+                    sensor >> tasks_by_id[root_id]
+
+    # ── Cross-DAG downstream triggers ────────────────────────────────────
+    # Each downstream entry triggers the target DAG after all tasks in this
+    # pipeline succeed, then waits for it to complete before marking this run done.
+    for downstream_dep in downstream_deps:
+        downstream_pid = downstream_dep["pipeline_id"]
+        conf           = downstream_dep.get("conf") or {}
+
+        trigger = TriggerDagRunOperator(
+            task_id=f"trigger_{downstream_pid}",
+            trigger_dag_id=downstream_pid,
+            wait_for_completion=True,
+            conf=conf,
+            trigger_rule="all_success",
+            dag=dag,
+        )
+        if "_pipeline_end" in tasks_by_id:
+            tasks_by_id["_pipeline_end"] >> trigger
+        else:
+            for leaf_id in leaves:
+                if leaf_id in tasks_by_id:
+                    tasks_by_id[leaf_id] >> trigger
 
     logger.info(f"Built DAG '{pid}' with {len(tasks_by_id)} tasks")
     return dag

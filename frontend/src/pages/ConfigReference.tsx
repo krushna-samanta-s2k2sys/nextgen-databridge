@@ -4,7 +4,7 @@ import {
   BookOpen, Search, ChevronRight, Copy, CheckCircle2,
   Database, Cpu, FileText, Bell, Zap, GitBranch,
   ArrowRight, Table2, MessageSquare, Cloud, Webhook,
-  Calendar, Server,
+  Calendar, Server, Network,
 } from 'lucide-react'
 import clsx from 'clsx'
 
@@ -32,6 +32,7 @@ interface TaskDef {
 // ── Categories ────────────────────────────────────────────────────────────────
 const CATEGORIES = [
   { id: 'pipeline',    label: 'Pipeline Envelope',   icon: FileText    },
+  { id: 'dependencies', label: 'DAG Dependencies',   icon: Network     },
   { id: 'connection',  label: 'Connection Profiles',  icon: Database    },
   { id: 'extract',     label: 'Data Extraction',      icon: ArrowRight  },
   { id: 'transform',   label: 'Transformation',       icon: Cpu         },
@@ -69,6 +70,7 @@ const TASK_DEFS: TaskDef[] = [
       { field: 'owner',       type: 'string', required: false, default: '"data-engineering"', description: 'Team or individual responsible for this pipeline.' },
       { field: 'tags',        type: 'string[]',required: false,description: 'Free-form labels shown in Airflow and the UI.' },
       { field: 'alerting',    type: 'object', required: false, description: 'Alert channels per event. Keys: on_failure, on_success, on_sla_breach, on_retry. Values: list of channel strings (slack:#ch, email:addr, pagerduty:key, teams:webhook, webhook:url).' },
+      { field: 'dag_dependencies', type: 'object', required: false, description: 'Cross-pipeline dependencies. upstream[] defines DAGs that must complete before this one starts; downstream[] defines DAGs this pipeline triggers on completion. See the DAG Dependencies reference for full schema.' },
       { field: 'tasks',       type: 'Task[]', required: true,  description: 'Ordered list of task definitions. Dependency order is declared via depends_on inside each task, not by array position.' },
     ],
     sample: `{
@@ -91,7 +93,67 @@ const TASK_DEFS: TaskDef[] = [
     "on_sla_breach": ["slack:#data-alerts"],
     "on_success":    ["slack:#data-notifications"]
   },
+  "dag_dependencies": {
+    "upstream":   [ /* see DAG Dependencies reference */ ],
+    "downstream": [ /* see DAG Dependencies reference */ ]
+  },
   "tasks": [ /* task definitions go here */ ]
+}`,
+  },
+
+  // ── DAG Dependencies ────────────────────────────────────────────────────
+  {
+    id: 'dag_dependencies',
+    label: 'DAG Dependencies',
+    category: 'dependencies',
+    icon: Network,
+    color: 'text-violet-600',
+    description: 'Cross-pipeline dependency management. upstream[] defines DAGs that must complete before this pipeline starts; downstream[] defines DAGs this pipeline triggers and waits for on completion. All dependencies always wait for completion.',
+    fields: [
+      { field: 'dag_dependencies',            type: 'object',   required: false, description: 'Top-level container. Place at the pipeline root level alongside "tasks".' },
+      { field: 'dag_dependencies.upstream',   type: 'object[]', required: false, description: 'DAGs that must finish before this pipeline\'s first task runs. Each entry creates an Airflow ExternalTaskSensor (reschedule mode, 60 s poke interval).' },
+      { field: '  upstream[].pipeline_id',    type: 'string',   required: true,  description: 'pipeline_id of the upstream DAG to wait for. Must differ from the current pipeline.' },
+      { field: '  upstream[].allowed_states', type: 'string[]', required: false, default: '["success"]', valid: '"success" | "failed" | "skipped" | "upstream_failed"', description: 'States that count as "done". Defaults to ["success"]. Use ["success","skipped"] to let skipped upstream runs unblock this pipeline.' },
+      { field: '  upstream[].timeout_minutes',type: 'number',   required: false, default: '240', description: 'How long (minutes) the sensor waits before timing out and failing this run.' },
+      { field: 'dag_dependencies.downstream', type: 'object[]', required: false, description: 'DAGs to trigger after all tasks in this pipeline succeed. Each entry creates a TriggerDagRunOperator and waits for the triggered run to complete.' },
+      { field: '  downstream[].pipeline_id',  type: 'string',   required: true,  description: 'pipeline_id of the downstream DAG to trigger.' },
+      { field: '  downstream[].conf',         type: 'object',   required: false, default: '{}', description: 'Arbitrary JSON passed to the triggered DAG run as dag_run.conf (e.g. trigger_source, date ranges).' },
+    ],
+    sample: `// configs/pipelines/wwi_analytics_summary.json (excerpt)
+{
+  "pipeline_id": "wwi_analytics_summary",
+  "schedule": "0 8 * * *",
+
+  "dag_dependencies": {
+    "upstream": [
+      {
+        // Airflow creates ExternalTaskSensor "wait_for_wwi_sales_etl".
+        // This pipeline will not start until wwi_sales_etl succeeds.
+        "pipeline_id": "wwi_sales_etl",
+        "allowed_states": ["success"],
+        "timeout_minutes": 120
+      },
+      {
+        // Sensor "wait_for_wwi_inventory_etl" — uses default timeout (240 min).
+        "pipeline_id": "wwi_inventory_etl"
+      }
+    ],
+    "downstream": [
+      {
+        // After all tasks succeed, Airflow creates TriggerDagRunOperator
+        // "trigger_wwi_reporting_refresh" and waits for it to finish.
+        "pipeline_id": "wwi_reporting_refresh",
+        "conf": { "trigger_source": "wwi_analytics_summary" }
+      }
+    ]
+  },
+
+  "tasks": [
+    { "task_id": "build_daily_revenue_summary", "type": "duckdb_transform", "sql": "..." },
+    { "task_id": "validate_summary", "type": "data_quality", "depends_on": ["build_daily_revenue_summary"], "checks": [] },
+    { "task_id": "load_summary", "type": "load_target", "depends_on": ["validate_summary"], "target": {} },
+    { "task_id": "notify_complete", "type": "notification", "depends_on": ["load_summary"], "trigger_rule": "all_done" }
+  ]
 }`,
   },
 
