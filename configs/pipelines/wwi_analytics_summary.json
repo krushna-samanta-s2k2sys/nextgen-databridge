@@ -20,20 +20,11 @@
 
   "dag_dependencies": {
     "upstream": [
-      {
-        "pipeline_id": "wwi_sales_etl",
-        "allowed_states": ["success"],
-        "timeout_minutes": 120
-      },
-      {
-        "pipeline_id": "wwi_inventory_etl"
-      }
+      { "pipeline_id": "wwi_sales_etl",     "await_status": "success" },
+      { "pipeline_id": "wwi_inventory_etl", "await_status": "success" }
     ],
     "downstream": [
-      {
-        "pipeline_id": "wwi_reporting_refresh",
-        "conf": { "trigger_source": "wwi_analytics_summary" }
-      }
+      { "pipeline_id": "wwi_reporting_refresh" }
     ]
   },
 
