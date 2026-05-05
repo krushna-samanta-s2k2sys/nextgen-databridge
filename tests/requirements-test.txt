@@ -8,3 +8,4 @@ freezegun==1.5.1
 duckdb>=0.10.3
 pandas>=2.0.0
 pyarrow>=14.0.0
+sqlalchemy>=2.0.0
