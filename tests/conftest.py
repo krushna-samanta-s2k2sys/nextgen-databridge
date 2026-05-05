@@ -79,6 +79,7 @@ _OPTIONAL = [
     "oracledb", "cx_Oracle",
     "pymssql",
     "sqlalchemy", "sqlalchemy.orm", "sqlalchemy.engine",
+    "airflow.sensors", "airflow.sensors.external_task",
     "opentelemetry", "opentelemetry.trace", "opentelemetry.metrics",
     "opentelemetry.sdk", "opentelemetry.sdk.trace", "opentelemetry.sdk.metrics",
     "prometheus_client",
