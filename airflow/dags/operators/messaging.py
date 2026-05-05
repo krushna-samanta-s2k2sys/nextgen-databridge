@@ -66,7 +66,10 @@ class KafkaOperator(NextGenDatabridgeBaseOperator):
             output_table = output.get("table", "kafka_messages")
 
             db = duckdb.connect(out_local)
-            db.execute(f"CREATE OR REPLACE TABLE {output_table} AS SELECT * FROM df")
+            if records:
+                db.execute(f"CREATE OR REPLACE TABLE {output_table} AS SELECT * FROM df")
+            else:
+                db.execute(f"CREATE OR REPLACE TABLE {output_table} (message VARCHAR)")
             schema_dict = {col[0]: col[1] for col in db.execute(f"DESCRIBE {output_table}").fetchall()}
             db.close()
 
@@ -139,7 +142,10 @@ class PubSubOperator(NextGenDatabridgeBaseOperator):
             output_table = output.get("table", "pubsub_messages")
 
             db = duckdb.connect(out_local)
-            db.execute(f"CREATE OR REPLACE TABLE {output_table} AS SELECT * FROM df")
+            if records:
+                db.execute(f"CREATE OR REPLACE TABLE {output_table} AS SELECT * FROM df")
+            else:
+                db.execute(f"CREATE OR REPLACE TABLE {output_table} (message VARCHAR)")
             db.close()
 
             self.upload_duckdb(out_local, out_s3)
