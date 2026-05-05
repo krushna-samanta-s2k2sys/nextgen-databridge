@@ -119,6 +119,10 @@ class PipelineConfigValidator:
                         "(use slack:#channel, email:addr, pagerduty:key, teams:webhook, webhook:url)"
                     )
 
+        # ── DAG dependencies (cross-pipeline) ────────────────────────────
+        if "dag_dependencies" in config:
+            self._validate_dag_dependencies(config, result)
+
         # ── tasks ────────────────────────────────────────────────────────
         tasks = config.get("tasks", [])
         if not isinstance(tasks, list) or len(tasks) == 0:
@@ -341,6 +345,57 @@ class PipelineConfigValidator:
                 f"Task '{task_id}' (stored_proc) has capture_resultset=true "
                 "but no output.duckdb_path defined"
             )
+
+    def _validate_dag_dependencies(self, config: dict, result: ValidationResult):
+        pid      = config.get("pipeline_id", "")
+        dag_deps = config.get("dag_dependencies", {})
+
+        if not isinstance(dag_deps, dict):
+            result.error("dag_dependencies must be an object with 'upstream' and/or 'downstream' keys")
+            return
+
+        _VALID_STATES = {"success", "failed", "skipped", "upstream_failed"}
+
+        for direction in ("upstream", "downstream"):
+            entries = dag_deps.get(direction, [])
+            if not entries:
+                continue
+            if not isinstance(entries, list):
+                result.error(f"dag_dependencies.{direction} must be a list")
+                continue
+
+            for i, entry in enumerate(entries):
+                if not isinstance(entry, dict):
+                    result.error(f"dag_dependencies.{direction}[{i}] must be an object")
+                    continue
+
+                dep_pid = entry.get("pipeline_id")
+                if not dep_pid or not isinstance(dep_pid, str):
+                    result.error(f"dag_dependencies.{direction}[{i}] must have a non-empty 'pipeline_id' string")
+                elif dep_pid == pid:
+                    result.error(f"dag_dependencies.{direction}[{i}]: pipeline cannot depend on itself ('{pid}')")
+
+                if direction == "upstream":
+                    allowed = entry.get("allowed_states")
+                    if allowed is not None:
+                        if not isinstance(allowed, list) or not all(isinstance(s, str) for s in allowed):
+                            result.error(f"dag_dependencies.upstream[{i}].allowed_states must be a list of strings")
+                        else:
+                            unknown = set(allowed) - _VALID_STATES
+                            if unknown:
+                                result.warn(
+                                    f"dag_dependencies.upstream[{i}].allowed_states contains "
+                                    f"unrecognised states: {sorted(unknown)}. "
+                                    f"Valid: {sorted(_VALID_STATES)}"
+                                )
+                    timeout = entry.get("timeout_minutes")
+                    if timeout is not None and (not isinstance(timeout, (int, float)) or timeout <= 0):
+                        result.error(f"dag_dependencies.upstream[{i}].timeout_minutes must be a positive number")
+
+                elif direction == "downstream":
+                    conf = entry.get("conf")
+                    if conf is not None and not isinstance(conf, dict):
+                        result.error(f"dag_dependencies.downstream[{i}].conf must be an object")
 
     def _check_dag_acyclic(self, tasks: List[dict], result: ValidationResult):
         """Topological sort (Kahn's algorithm) to detect cycles"""

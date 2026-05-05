@@ -1,0 +1,107 @@
+{
+  "pipeline_id": "wwi_analytics_summary",
+  "version": "1.0.0",
+  "description": "Cross-pipeline analytics summary. Waits for wwi_sales_etl and wwi_inventory_etl to complete before aggregating, then triggers wwi_reporting_refresh and waits for it to finish.",
+  "schedule": "0 8 * * *",
+  "retries": 2,
+  "retry_delay_minutes": 10,
+  "sla_minutes": 90,
+  "max_active_runs": 1,
+  "catchup": false,
+  "dag_timeout_minutes": 180,
+  "owner": "data-engineering",
+  "team": "analytics",
+  "tags": ["wwi", "analytics", "cross-dag", "daily"],
+  "alerting": {
+    "on_failure":    ["slack:#data-alerts", "email:data-eng@company.com"],
+    "on_sla_breach": ["slack:#data-alerts"],
+    "on_success":    ["slack:#data-notifications"]
+  },
+
+  "dag_dependencies": {
+    "upstream": [
+      {
+        "pipeline_id": "wwi_sales_etl",
+        "allowed_states": ["success"],
+        "timeout_minutes": 120
+      },
+      {
+        "pipeline_id": "wwi_inventory_etl"
+      }
+    ],
+    "downstream": [
+      {
+        "pipeline_id": "wwi_reporting_refresh",
+        "conf": { "trigger_source": "wwi_analytics_summary" }
+      }
+    ]
+  },
+
+  "tasks": [
+    {
+      "task_id": "build_daily_revenue_summary",
+      "type": "duckdb_transform",
+      "sql": "SELECT DATE_TRUNC('day', CAST(o.OrderDate AS TIMESTAMP)) AS SalesDate, c.CustomerName, sp.SalespersonName, COUNT(DISTINCT o.OrderID) AS OrderCount, SUM(ol.Quantity) AS TotalUnits, ROUND(SUM(ol.Quantity * ol.UnitPrice), 2) AS TotalRevenue, ROUND(SUM(ol.Quantity * ol.UnitPrice * ol.TaxRate / 100.0), 2) AS TotalTax, ROUND(SUM(ol.Quantity * ol.UnitPrice * (1 + ol.TaxRate / 100.0)), 2) AS TotalRevenueIncTax, CURRENT_TIMESTAMP AS etl_loaded_at FROM wwi_sales_etl.order_header o JOIN wwi_sales_etl.order_lines_detail ol ON o.OrderID = ol.OrderID LEFT JOIN wwi_sales_etl.raw_customers c ON o.CustomerID = c.CustomerID LEFT JOIN wwi_sales_etl.raw_salespeople sp ON o.SalespersonPersonID = sp.PersonID GROUP BY DATE_TRUNC('day', CAST(o.OrderDate AS TIMESTAMP)), c.CustomerName, sp.SalespersonName",
+      "output": {
+        "duckdb_path": "analytics/daily_revenue_summary/{{ ds }}/data.parquet",
+        "table": "daily_revenue_summary"
+      }
+    },
+    {
+      "task_id": "build_product_velocity",
+      "type": "duckdb_transform",
+      "sql": "SELECT ol.StockItemID, ol.StockItemDescription, SUM(ol.Quantity) AS TotalUnitsSold, COUNT(DISTINCT ol.OrderID) AS OrderCount, ROUND(SUM(ol.Quantity * ol.UnitPrice), 2) AS TotalRevenue, ROUND(AVG(ol.UnitPrice), 2) AS AvgUnitPrice, CURRENT_TIMESTAMP AS etl_loaded_at FROM wwi_sales_etl.order_lines_detail ol GROUP BY ol.StockItemID, ol.StockItemDescription ORDER BY TotalUnitsSold DESC",
+      "output": {
+        "duckdb_path": "analytics/product_velocity/{{ ds }}/data.parquet",
+        "table": "product_velocity"
+      }
+    },
+    {
+      "task_id": "validate_summary",
+      "type": "data_quality",
+      "depends_on": ["build_daily_revenue_summary"],
+      "source": { "table": "daily_revenue_summary" },
+      "checks": [
+        { "type": "row_count_min", "value": 1,          "action": "fail" },
+        { "type": "not_null", "column": "SalesDate",    "action": "fail" },
+        { "type": "not_null", "column": "TotalRevenue", "action": "fail" },
+        { "type": "value_range", "column": "TotalRevenue", "min": 0, "action": "fail" }
+      ],
+      "fail_pipeline_on_error": true
+    },
+    {
+      "task_id": "load_daily_revenue_summary",
+      "type": "load_target",
+      "depends_on": ["validate_summary"],
+      "source": { "table": "daily_revenue_summary" },
+      "target": {
+        "type": "sqlserver",
+        "connection": "wwi_sqlserver_target",
+        "schema": "analytics",
+        "table": "DailyRevenueSummary",
+        "mode": "append"
+      }
+    },
+    {
+      "task_id": "load_product_velocity",
+      "type": "load_target",
+      "depends_on": ["build_product_velocity"],
+      "source": { "table": "product_velocity" },
+      "target": {
+        "type": "sqlserver",
+        "connection": "wwi_sqlserver_target",
+        "schema": "analytics",
+        "table": "ProductVelocity",
+        "mode": "append"
+      }
+    },
+    {
+      "task_id": "notify_complete",
+      "type": "notification",
+      "depends_on": ["load_daily_revenue_summary", "load_product_velocity"],
+      "trigger_rule": "all_done",
+      "channels": ["slack:#data-notifications"],
+      "message": "wwi_analytics_summary completed for {{ ds }} — DailyRevenueSummary and ProductVelocity updated."
+    }
+  ]
+}
