@@ -65,7 +65,8 @@ const TASK_DEFS: TaskDef[] = [
       { field: 'retry_exponential_backoff', type: 'boolean', required: false, default: 'false', description: 'Double the retry delay on each attempt.' },
       { field: 'sla_minutes', type: 'number', required: false, description: 'Trigger an SLA breach alert if the run exceeds this duration.' },
       { field: 'max_active_runs', type: 'integer', required: false, default: '1', description: 'Maximum concurrent DAG runs.' },
-      { field: 'catchup',     type: 'boolean',required: false, default: 'false',   description: 'Whether Airflow should backfill missed scheduled runs.' },
+      { field: 'catchup',          type: 'boolean',required: false, default: 'false',  description: 'Whether Airflow should backfill missed scheduled runs.' },
+      { field: 'depends_on_past',  type: 'boolean',required: false, default: 'false',  description: 'If true, each DAG run waits for the previous run of the same pipeline to succeed before starting. Useful for pipelines with cumulative state.' },
       { field: 'dag_timeout_minutes', type: 'integer', required: false, default: '120', description: 'Hard timeout for the entire DAG run.' },
       { field: 'owner',       type: 'string', required: false, default: '"data-engineering"', description: 'Team or individual responsible for this pipeline.' },
       { field: 'tags',        type: 'string[]',required: false,description: 'Free-form labels shown in Airflow and the UI.' },
@@ -132,6 +133,48 @@ const TASK_DEFS: TaskDef[] = [
   },
 
   "tasks": [ /* ... */ ]
+}`,
+  },
+
+  // ── Common Task Fields ───────────────────────────────────────────────────
+  {
+    id: 'task_common_fields',
+    label: 'Common Task Fields',
+    category: 'pipeline',
+    icon: Zap,
+    color: 'text-gray-500',
+    description: 'Fields that can be added to any task type. They override the pipeline-level defaults for that specific task and are processed by the DAG generator before the type-specific operator is created.',
+    fields: [
+      { field: 'task_id',              type: 'string',   required: true,  description: 'Unique snake_case identifier within the pipeline. Used as the Airflow task_id and as the ATTACH alias when downstream DuckDB transforms reference this task\'s output.' },
+      { field: 'type',                 type: 'string',   required: true,  description: 'Task type — determines which operator is used. See the individual task type references.' },
+      { field: 'depends_on',           type: 'string[]', required: false, default: '[]', description: 'Upstream task_ids this task waits for. Airflow wires these as upstream dependencies using the >> operator.' },
+      { field: 'trigger_rule',         type: 'string',   required: false, default: '"all_success"', valid: '"all_success" | "all_done" | "all_failed" | "one_success" | "one_done" | "none_failed" | "none_skipped" | "none_failed_min_one_success"', description: 'Controls when this task runs relative to its upstream tasks. Use "all_done" on notification tasks so they fire regardless of upstream success or failure.' },
+      { field: 'group',                type: 'string',   required: false, description: 'Assigns this task to an Airflow TaskGroup. Tasks sharing the same group string are visually collapsible in the Airflow UI. The group is created automatically on first use.' },
+      { field: 'timeout_minutes',      type: 'integer',  required: false, default: 'pipeline task_timeout_minutes (120)', description: 'Hard execution timeout for this task only. Overrides the pipeline-level task_timeout_minutes.' },
+      { field: 'retries',              type: 'integer',  required: false, default: 'pipeline retries', valid: '0–10', description: 'Retry count for this task. Overrides the pipeline-level retries field.' },
+      { field: 'retry_delay_minutes',  type: 'integer',  required: false, default: 'pipeline retry_delay_minutes', description: 'Minutes between retries for this task. Overrides the pipeline-level retry_delay_minutes.' },
+      { field: 'engine',               type: 'string',   required: false, valid: '"eks"', description: 'Set to "eks" to run this task as a Kubernetes Job instead of on the MWAA worker. Applies to sql_extract, duckdb_transform, and other operator types. See the eks_job reference for execution sub-fields.' },
+    ],
+    sample: `{
+  "task_id": "transform_summary",
+  "type": "duckdb_transform",
+  "depends_on": ["validate_orders", "extract_customers"],
+  "trigger_rule": "all_success",
+  "group": "transform_phase",
+  "timeout_minutes": 30,
+  "retries": 1,
+  "retry_delay_minutes": 2,
+  "sql": "SELECT * FROM validate_orders.raw_orders"
+}
+
+// Notification that always fires — even if upstream tasks failed:
+{
+  "task_id": "notify_complete",
+  "type": "notification",
+  "depends_on": ["load_orders", "load_summary"],
+  "trigger_rule": "all_done",
+  "channels": ["slack:#data-notifications"],
+  "message": "Pipeline finished for {{ ds }}"
 }`,
   },
 
@@ -328,7 +371,7 @@ const TASK_DEFS: TaskDef[] = [
       { field: 'depends_on',     type: 'string[]',required: true,  description: 'Single upstream task whose DuckDB output is checked.' },
       { field: 'source.table',   type: 'string',  required: false, default: '"raw_data"', description: 'Table name inside the upstream DuckDB file.' },
       { field: 'checks',         type: 'Check[]', required: true,  description: 'List of check objects (see check types below).' },
-      { field: 'checks[].type',  type: 'string',  required: true,  valid: '"not_null" | "unique" | "row_count_min" | "row_count_max" | "freshness" | "value_range" | "regex_match" | "schema_match" | "custom_sql"', description: 'Type of quality check to run.' },
+      { field: 'checks[].type',  type: 'string',  required: true,  valid: '"not_null" | "unique" | "row_count_min" | "row_count_max" | "freshness" | "value_range" | "regex_match" | "referential_integrity" | "schema_match" | "custom_sql"', description: 'Type of quality check to run.' },
       { field: 'checks[].column',type: 'string',  required: false, description: 'Column to check. Required for not_null, unique, value_range, regex_match, freshness.' },
       { field: 'checks[].action',type: 'string',  required: false, default: '"fail"', valid: '"fail" | "warn" | "skip"', description: 'What to do when the check fails. "warn" records the failure but does not stop the pipeline.' },
       { field: 'checks[].value', type: 'number',  required: false, description: 'Threshold value for row_count_min / row_count_max checks.' },
