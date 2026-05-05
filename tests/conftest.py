@@ -78,6 +78,7 @@ _OPTIONAL = [
     "kafka", "kafka.errors",
     "oracledb", "cx_Oracle",
     "pymssql",
+    "sqlalchemy", "sqlalchemy.orm", "sqlalchemy.engine",
     "opentelemetry", "opentelemetry.trace", "opentelemetry.metrics",
     "opentelemetry.sdk", "opentelemetry.sdk.trace", "opentelemetry.sdk.metrics",
     "prometheus_client",
