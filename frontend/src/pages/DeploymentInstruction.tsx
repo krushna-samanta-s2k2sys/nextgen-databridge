@@ -987,6 +987,20 @@ function GitHubActionsTab() {
               }
             />
 
+            <WorkflowCard file="list-versions.yml" name="List Versions" icon={Package} color="bg-slate-600"
+              trigger="Manual only"
+              description="Queries AWS SSM Parameter Store and writes a summary table to the GitHub Actions job summary. Shows the version currently live on dev and staging, then lists recent version manifests (newest first) with version ID, commit SHA, deploy date, actor, which artifacts changed (apps/dags/configs), and a link to the original deploy run. Run this before triggering Promote to find the version ID you want to promote."
+              inputs={<InputRow name="count" required={false} desc="Number of recent versions to show (default: 10)." />}
+              jobsNode={
+                <div className="space-y-3">
+                  <JobChain jobs={[
+                    { id: 'l', label: 'Fetch versions from SSM', note: 'reads /nextgen-databridge/versions/*' },
+                  ]} />
+                  <NoteBox type="info">{'Version ID format: v{YYYYMMDD}-{HHMMSS}-{sha7} — e.g. v20260504-145230-b9138fb. Copy it from the job summary and paste into the Promote workflow\'s version_id input. Leave version_id blank in Promote to auto-promote the latest version.'}</NoteBox>
+                </div>
+              }
+            />
+
             <WorkflowCard file="developer-access.yml" name="Developer Access Toggle" icon={Key} color="bg-teal-600"
               trigger="Manual only"
               description="Temporarily opens or closes direct developer access to RDS databases and web services. For databases it adds or revokes a security group ingress rule. For web-api it outputs the current NLB hostnames (always internet-facing — no SG change needed)."

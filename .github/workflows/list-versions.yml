@@ -1,0 +1,93 @@
+name: List Versions
+
+# Run this before triggering Promote to see what version IDs are available.
+# The job summary shows a table of recent versions with their current environment
+# pointers (dev / staging) so you can copy-paste the right version_id.
+
+on:
+  workflow_dispatch:
+    inputs:
+      count:
+        description: "Number of recent versions to list"
+        required: false
+        default: "10"
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+  ROLE_ARN_DEV: arn:aws:iam::877707676590:role/nextgen-databridge-github-actions-dev
+
+jobs:
+  list:
+    name: List Available Versions
+    runs-on: ubuntu-latest
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.ROLE_ARN_DEV }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Fetch versions from SSM and write summary
+        run: |
+          COUNT="${{ inputs.count }}"
+
+          DEV_VER=$(aws ssm get-parameter \
+            --name "/nextgen-databridge/deploy/dev/latest-version" \
+            --query Parameter.Value --output text 2>/dev/null || echo "—")
+          STAGING_VER=$(aws ssm get-parameter \
+            --name "/nextgen-databridge/deploy/staging/latest-version" \
+            --query Parameter.Value --output text 2>/dev/null || echo "—")
+
+          PARAMS=$(aws ssm get-parameters-by-path \
+            --path "/nextgen-databridge/versions/" \
+            --recursive \
+            --query "Parameters[*].Value" \
+            --output json 2>/dev/null || echo "[]")
+
+          {
+            echo "## Available Versions"
+            echo ""
+            echo "| Environment | Live Version |"
+            echo "|---|---|"
+            echo "| dev     | \`${DEV_VER}\` |"
+            echo "| staging | \`${STAGING_VER}\` |"
+            echo ""
+            echo "### Recent versions — newest first"
+            echo ""
+            echo "| Version ID | Commit | Date (UTC) | Actor | Apps | DAGs | Configs | Run |"
+            echo "|---|---|---|---|---|---|---|---|"
+
+            echo "$PARAMS" | python3 - <<'PYEOF'
+import json, sys
+
+params = json.loads(sys.stdin.read())
+manifests = []
+for raw in params:
+    try:
+        manifests.append(json.loads(raw))
+    except Exception:
+        pass
+
+manifests.sort(key=lambda x: x.get("created_at", ""), reverse=True)
+
+for m in manifests[:int("$COUNT")]:
+    vid     = m.get("version_id", "?")
+    sha     = m.get("sha", "?")[:7]
+    created = m.get("created_at", "?")[:16].replace("T", " ")
+    actor   = m.get("created_by", "?")
+    arts    = m.get("artifacts", {})
+    apps    = "✓" if arts.get("apps")    else "—"
+    dags    = "✓" if arts.get("dags")    else "—"
+    cfgs    = "✓" if arts.get("configs") else "—"
+    run_url = m.get("run_url", "")
+    run_id  = m.get("run_id", "?")
+    run_lnk = f"[#{run_id}]({run_url})" if run_url else run_id
+    print(f"| `{vid}` | `{sha}` | {created} | {actor} | {apps} | {dags} | {cfgs} | {run_lnk} |")
+PYEOF
+
+            echo ""
+            echo "> **To promote:** copy a \`version_id\` from the table, open **Actions → Promote → Run workflow**, paste it into the \`version_id\` field, and choose the target environment."
+          } >> "$GITHUB_STEP_SUMMARY"
