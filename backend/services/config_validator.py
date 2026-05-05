@@ -371,31 +371,17 @@ class PipelineConfigValidator:
 
                 dep_pid = entry.get("pipeline_id")
                 if not dep_pid or not isinstance(dep_pid, str):
-                    result.error(f"dag_dependencies.{direction}[{i}] must have a non-empty 'pipeline_id' string")
+                    result.error(f"dag_dependencies.{direction}[{i}] must have a non-empty 'pipeline_id'")
                 elif dep_pid == pid:
                     result.error(f"dag_dependencies.{direction}[{i}]: pipeline cannot depend on itself ('{pid}')")
 
                 if direction == "upstream":
-                    allowed = entry.get("allowed_states")
-                    if allowed is not None:
-                        if not isinstance(allowed, list) or not all(isinstance(s, str) for s in allowed):
-                            result.error(f"dag_dependencies.upstream[{i}].allowed_states must be a list of strings")
-                        else:
-                            unknown = set(allowed) - _VALID_STATES
-                            if unknown:
-                                result.warn(
-                                    f"dag_dependencies.upstream[{i}].allowed_states contains "
-                                    f"unrecognised states: {sorted(unknown)}. "
-                                    f"Valid: {sorted(_VALID_STATES)}"
-                                )
-                    timeout = entry.get("timeout_minutes")
-                    if timeout is not None and (not isinstance(timeout, (int, float)) or timeout <= 0):
-                        result.error(f"dag_dependencies.upstream[{i}].timeout_minutes must be a positive number")
-
-                elif direction == "downstream":
-                    conf = entry.get("conf")
-                    if conf is not None and not isinstance(conf, dict):
-                        result.error(f"dag_dependencies.downstream[{i}].conf must be an object")
+                    await_status = entry.get("await_status", "success")
+                    if await_status not in _VALID_STATES:
+                        result.error(
+                            f"dag_dependencies.upstream[{i}].await_status '{await_status}' is not valid. "
+                            f"Valid: {sorted(_VALID_STATES)}"
+                        )
 
     def _check_dag_acyclic(self, tasks: List[dict], result: ValidationResult):
         """Topological sort (Kahn's algorithm) to detect cycles"""

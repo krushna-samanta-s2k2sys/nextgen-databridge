@@ -108,52 +108,30 @@ const TASK_DEFS: TaskDef[] = [
     category: 'dependencies',
     icon: Network,
     color: 'text-violet-600',
-    description: 'Cross-pipeline dependency management. upstream[] defines DAGs that must complete before this pipeline starts; downstream[] defines DAGs this pipeline triggers and waits for on completion. All dependencies always wait for completion.',
+    description: 'Cross-pipeline dependency management. upstream[] defines DAGs that must complete before this pipeline starts; downstream[] defines DAGs this pipeline triggers on completion. Each entry needs only a name and the status to await.',
     fields: [
-      { field: 'dag_dependencies',            type: 'object',   required: false, description: 'Top-level container. Place at the pipeline root level alongside "tasks".' },
-      { field: 'dag_dependencies.upstream',   type: 'object[]', required: false, description: 'DAGs that must finish before this pipeline\'s first task runs. Each entry creates an Airflow ExternalTaskSensor (reschedule mode, 60 s poke interval).' },
-      { field: '  upstream[].pipeline_id',    type: 'string',   required: true,  description: 'pipeline_id of the upstream DAG to wait for. Must differ from the current pipeline.' },
-      { field: '  upstream[].allowed_states', type: 'string[]', required: false, default: '["success"]', valid: '"success" | "failed" | "skipped" | "upstream_failed"', description: 'States that count as "done". Defaults to ["success"]. Use ["success","skipped"] to let skipped upstream runs unblock this pipeline.' },
-      { field: '  upstream[].timeout_minutes',type: 'number',   required: false, default: '240', description: 'How long (minutes) the sensor waits before timing out and failing this run.' },
-      { field: 'dag_dependencies.downstream', type: 'object[]', required: false, description: 'DAGs to trigger after all tasks in this pipeline succeed. Each entry creates a TriggerDagRunOperator and waits for the triggered run to complete.' },
-      { field: '  downstream[].pipeline_id',  type: 'string',   required: true,  description: 'pipeline_id of the downstream DAG to trigger.' },
-      { field: '  downstream[].conf',         type: 'object',   required: false, default: '{}', description: 'Arbitrary JSON passed to the triggered DAG run as dag_run.conf (e.g. trigger_source, date ranges).' },
+      { field: 'dag_dependencies',           type: 'object',   required: false, description: 'Top-level container. Place at the pipeline root level alongside "tasks".' },
+      { field: 'dag_dependencies.upstream',  type: 'object[]', required: false, description: 'DAGs that must finish before this pipeline\'s first task runs. Creates one ExternalTaskSensor per entry.' },
+      { field: '  upstream[].pipeline_id',   type: 'string',   required: true,  description: 'pipeline_id of the upstream DAG to wait for.' },
+      { field: '  upstream[].await_status',  type: 'string',   required: false, default: '"success"', valid: '"success" | "failed" | "skipped" | "upstream_failed"', description: 'The DAG run state that unblocks this pipeline.' },
+      { field: 'dag_dependencies.downstream',type: 'object[]', required: false, description: 'DAGs to trigger after all tasks in this pipeline succeed. Creates one TriggerDagRunOperator per entry and waits for it to complete.' },
+      { field: '  downstream[].pipeline_id', type: 'string',   required: true,  description: 'pipeline_id of the downstream DAG to trigger.' },
     ],
-    sample: `// configs/pipelines/wwi_analytics_summary.json (excerpt)
-{
+    sample: `{
   "pipeline_id": "wwi_analytics_summary",
   "schedule": "0 8 * * *",
 
   "dag_dependencies": {
     "upstream": [
-      {
-        // Airflow creates ExternalTaskSensor "wait_for_wwi_sales_etl".
-        // This pipeline will not start until wwi_sales_etl succeeds.
-        "pipeline_id": "wwi_sales_etl",
-        "allowed_states": ["success"],
-        "timeout_minutes": 120
-      },
-      {
-        // Sensor "wait_for_wwi_inventory_etl" — uses default timeout (240 min).
-        "pipeline_id": "wwi_inventory_etl"
-      }
+      { "pipeline_id": "wwi_sales_etl",     "await_status": "success" },
+      { "pipeline_id": "wwi_inventory_etl", "await_status": "success" }
     ],
     "downstream": [
-      {
-        // After all tasks succeed, Airflow creates TriggerDagRunOperator
-        // "trigger_wwi_reporting_refresh" and waits for it to finish.
-        "pipeline_id": "wwi_reporting_refresh",
-        "conf": { "trigger_source": "wwi_analytics_summary" }
-      }
+      { "pipeline_id": "wwi_reporting_refresh" }
     ]
   },
 
-  "tasks": [
-    { "task_id": "build_daily_revenue_summary", "type": "duckdb_transform", "sql": "..." },
-    { "task_id": "validate_summary", "type": "data_quality", "depends_on": ["build_daily_revenue_summary"], "checks": [] },
-    { "task_id": "load_summary", "type": "load_target", "depends_on": ["validate_summary"], "target": {} },
-    { "task_id": "notify_complete", "type": "notification", "depends_on": ["load_summary"], "trigger_rule": "all_done" }
-  ]
+  "tasks": [ /* ... */ ]
 }`,
   },
 

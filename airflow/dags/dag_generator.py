@@ -332,17 +332,16 @@ def build_dag(pipeline_config: dict) -> DAG:
     downstream_deps = dag_deps.get("downstream", [])
 
     for upstream_dep in upstream_deps:
-        upstream_pid   = upstream_dep["pipeline_id"]
-        allowed_states = upstream_dep.get("allowed_states", ["success"])
-        timeout_secs   = int(upstream_dep.get("timeout_minutes", 240) * 60)
+        upstream_pid = upstream_dep["pipeline_id"]
+        await_status = upstream_dep.get("await_status", "success")
 
         sensor = ExternalTaskSensor(
             task_id=f"wait_for_{upstream_pid}",
             external_dag_id=upstream_pid,
             external_task_id=None,  # None = wait for the entire upstream DAG
-            allowed_states=allowed_states,
+            allowed_states=[await_status],
             poke_interval=60,
-            timeout=timeout_secs,
+            timeout=14400,          # 4-hour hard cap
             mode="reschedule",      # free the worker slot between pokes
             dag=dag,
         )
@@ -358,13 +357,11 @@ def build_dag(pipeline_config: dict) -> DAG:
     # pipeline succeed, then waits for it to complete before marking this run done.
     for downstream_dep in downstream_deps:
         downstream_pid = downstream_dep["pipeline_id"]
-        conf           = downstream_dep.get("conf") or {}
 
         trigger = TriggerDagRunOperator(
             task_id=f"trigger_{downstream_pid}",
             trigger_dag_id=downstream_pid,
             wait_for_completion=True,
-            conf=conf,
             trigger_rule="all_success",
             dag=dag,
         )
